@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 # ------------------------------------------------
 # API KEY - Polygon.io
 # ------------------------------------------------
-POLYGON_API_KEY = "***REMOVED-POLYGON-API-KEY***"
+POLYGON_API_KEY = "NN"
 
 # Si prefieres no dejar la key escrita en el archivo, define la variable de
 # entorno POLYGON_API_KEY (en la terminal: export POLYGON_API_KEY="tu_key")
