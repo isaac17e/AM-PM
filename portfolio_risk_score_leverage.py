@@ -31,7 +31,7 @@ end_date = date.today()
 # --- API KEY DE POLYGON ---
 import os
 # >>> PEGA TU POLYGON API KEY AQUI (entre las comillas) <<<
-polygon_api_key = "***REMOVED-POLYGON-API-KEY***"
+polygon_api_key = "NN"
 
 # Si prefieres no dejar la key escrita en el archivo, define la variable de
 # entorno POLYGON_API_KEY (en la terminal: export POLYGON_API_KEY="tu_key")
