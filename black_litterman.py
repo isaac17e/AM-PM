@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 # ------------------------------------------------
 # API KEY - Polygon.io
 # ------------------------------------------------
-POLYGON_API_KEY = "***REMOVED-POLYGON-API-KEY***"
+POLYGON_API_KEY = "NN"
 
 if not POLYGON_API_KEY:
     POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
