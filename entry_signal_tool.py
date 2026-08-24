@@ -20,7 +20,7 @@ import os
 
 # ---------------- CONFIGURACION ----------------
 # >>> PEGA TU POLYGON API KEY AQUI (entre las comillas) <<<
-API_KEY = "***REMOVED-POLYGON-API-KEY***"
+API_KEY = "NN"
 
 # Si prefieres no dejar la key escrita en el archivo, define la variable de
 # entorno POLYGON_API_KEY (en la terminal: export POLYGON_API_KEY="tu_key")
