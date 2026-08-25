@@ -8,6 +8,8 @@ warnings.filterwarnings("ignore")
 import time
 import math
 import itertools
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from dateutil.relativedelta import relativedelta
 
@@ -92,6 +94,8 @@ bkm_min_options_per_side = 3     # minimo de strikes OTM por lado (calls/puts) p
 bkm_mfis_clip = 10.0              # cota de winsorizacion para MFIS (estabilidad numerica en activos de baja MFIV)
 bkm_mfik_clip = 30.0              # cota de winsorizacion para MFIK (idem)
 bkm_lookback_months = 12         # ventana para reconstruir el MFIS historico "normal" del activo
+bkm_hist_sample_freq = "2W"      # frecuencia de muestreo historico BKM (2W=quincenal; toleramos huecos, min. 8 puntos validos)
+bkm_max_workers = 6              # tickers evaluados en paralelo durante el filtro BKM (ajustar segun rate limit del plan Polygon)
 bkm_z_threshold = 1.75           # se descarta si (MFIS_hoy - media_hist) / sd_hist supera esto
 bkm_min_survivors = 14           # piso minimo tras el filtro BKM (se repone desde el pool estacional)
 tail_penalty_theta1 = 0.005       # theta1: escala de penalizacion por asimetria implicita (MFIS) en mu
@@ -177,17 +181,20 @@ polygon_diag = {
     "total_attempts": 0,
     "empty_match_count": 0,
 }
+polygon_diag_lock = threading.Lock()  # protege polygon_diag: el filtro BKM ahora evalua tickers en paralelo
 
 
 def polygon_log_status(status, body=None):
     key = str(status)
-    polygon_diag["status_counts"][key] = polygon_diag["status_counts"].get(key, 0) + 1
-    if status != 200 and len(polygon_diag["sample_errors"]) < 5:
-        polygon_diag["sample_errors"].append({"status": status, "body": body})
+    with polygon_diag_lock:
+        polygon_diag["status_counts"][key] = polygon_diag["status_counts"].get(key, 0) + 1
+        if status != 200 and len(polygon_diag["sample_errors"]) < 5:
+            polygon_diag["sample_errors"].append({"status": status, "body": body})
 
 
 def polygon_api_request(url, max_retries=5, sleep_between=0.3):
-    polygon_diag["total_attempts"] += 1
+    with polygon_diag_lock:
+        polygon_diag["total_attempts"] += 1
     for intento in range(1, max_retries + 1):
         try:
             resp = requests.get(url, timeout=20)
@@ -1452,9 +1459,9 @@ print(f"\nAplicando filtro MFIS (Bakshi-Kapadia-Madan) (z_threshold={bkm_z_thres
 
 hoy_ts = pd.Timestamp(date.today())
 sample_dates_bkm = pd.date_range(
-    hoy_ts - relativedelta(months=bkm_lookback_months), hoy_ts - timedelta(days=7), freq="W"
+    hoy_ts - relativedelta(months=bkm_lookback_months), hoy_ts - timedelta(days=7), freq=bkm_hist_sample_freq
 )
-print(f"   Fechas de muestreo historico: {len(sample_dates_bkm)} (semanal)")
+print(f"   Fechas de muestreo historico: {len(sample_dates_bkm)} (freq={bkm_hist_sample_freq})")
 
 reponer_pool_bkm = (
     seasonal_ratio_stats[~seasonal_ratio_stats["symbol"].isin(ticker_candidates)]
@@ -1510,13 +1517,15 @@ por_evaluar = list(ticker_candidates)
 ronda_bkm = 1
 
 while True:
-    print(f"   [Ronda {ronda_bkm}] Evaluando MFIS de {len(por_evaluar)} activo(s)...")
+    print(f"   [Ronda {ronda_bkm}] Evaluando MFIS de {len(por_evaluar)} activo(s) "
+          f"({bkm_max_workers} en paralelo)...")
 
     resultados = []
-    for k, tk in enumerate(por_evaluar, start=1):
-        resultados.append(evaluar_bkm_activo(tk))
-        if k % 10 == 0 or k == len(por_evaluar):
-            print(f"      ... {k}/{len(por_evaluar)}")
+    with ThreadPoolExecutor(max_workers=bkm_max_workers) as executor:
+        for k, r in enumerate(executor.map(evaluar_bkm_activo, por_evaluar), start=1):
+            resultados.append(r)
+            if k % 10 == 0 or k == len(por_evaluar):
+                print(f"      ... {k}/{len(por_evaluar)}")
 
     resultados_log.extend(resultados)
     descartados = [r for r in resultados if r["decision"] == "descartar"]
