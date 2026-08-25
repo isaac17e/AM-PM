@@ -1,5 +1,5 @@
 # ==============================================================================
-# OPTIMIZACION DE PORTAFOLIOS - MINIMA VARIANZA (VARIANTE ESTACIONAL)
+# OPTIMIZACION DE PORTAFOLIOS - MINIMA VARIANZA (Seasonal Version)
 # ==============================================================================
 
 import warnings
@@ -48,24 +48,24 @@ n_top_international = 30
 target_total_tickers = 130
 
 # HORIZONTE DE DATOS HISTORICOS
-start_date = "2014-01-01"
+start_date = "2018-01-01"
 end_date = date.today()
 
 # MESES DE EJECUCION: define el horizonte de inversion.
-execution_months = [8]
+execution_months = [9]
 
 # PARAMETROS FINANCIEROS
 risk_free_rate = 0.045
 risk_free_rate_weekly = risk_free_rate / 52
 
-n_pre_seasonal = 60
+n_pre_seasonal = 45
 n_divers_candidates = 45
 
-volatility_percentile = 0.85
-correlation_percentile = 0.75
-max_assets_in_portfolio = 10
+volatility_percentile = 0.97
+correlation_percentile = 0.90
+max_assets_in_portfolio = 6
 
-seasonal_min_weeks = 15
+seasonal_min_weeks = 10
 
 # === PARAMETROS BKM Y TAIL RISK (VaR_CF Cornish-Fisher, fusionado con la ventana estacional) ===
 bkm_moneyness_lo = 0.70            # limite inferior de moneyness K/S para strikes OTM
@@ -81,7 +81,7 @@ tail_risk_alpha = 0.05              # alpha: aversion a curtosis implicita (MFIK
 tail_risk_beta = 0.05               # beta: aversion a asimetria implicita negativa (MFIS) en diag(Sigma)
 
 # RESTRICCIONES DE PONDERACION
-max_weight_per_asset = 0.22
+max_weight_per_asset = 0.35
 min_weight_per_asset = 0.001
 
 # ESTRATEGIA DE PONDERACION
@@ -92,7 +92,7 @@ max_total_weight = 1.00
 # === RESTRICCION DE PARTICIPACION DE ETFs EN EL PORTAFOLIO FINAL ===
 use_etf_constraint = True
 etf_min_weight = 0.00
-etf_max_weight = 0.20
+etf_max_weight = 0.05
 
 # === RESTRICCION DE EXPOSICION CAMBIARIA (tickers no denominados en USD) ===
 use_fx_factor = True
@@ -102,7 +102,7 @@ annualization_factor = 52
 
 # === FILTRO DELTA (Black-Scholes) ===
 use_delta_filter = True
-delta_min = 0.45
+delta_min = 0.30
 delta_strike_mode = "atm"
 target_dte_iv = 30
 dte_tol_iv = 7
@@ -110,9 +110,9 @@ moneyness_tol_iv = 0.02
 
 # === SHRINKAGE COVARIANZA: IMPLIED vs HISTORICA ===
 use_iv_shrinkage = True
-shrinkage_max = 0.70
+shrinkage_max = 0.40
 shrinkage_min = 0.02
-ratio_band = 0.25
+ratio_band = 0.20
 
 # === CORRELACION IMPLICITA DE FACTORES (MERCADO + SECTOR + PAIS + FX) ===
 use_sector_factor = True

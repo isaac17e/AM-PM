@@ -43,10 +43,10 @@ benchmark = "SPY"
 
 n_top_sp500 = 80
 n_top_nasdaq = 80
-n_top_international = 40
+n_top_international = 15
 target_total_tickers = 200
 
-start_date = "2014-01-01"
+start_date = "2018-01-01"
 end_date = date.today()
 
 horizon_months = 1
@@ -79,9 +79,9 @@ n_divers_candidates = 35
 
 volatility_percentile = 0.97
 correlation_percentile = 0.9
-max_assets_in_portfolio = 8
+max_assets_in_portfolio = 6
 
-max_weight_per_asset = 0.22
+max_weight_per_asset = 0.35
 min_weight_per_asset = 0.001
 
 require_full_investment = False

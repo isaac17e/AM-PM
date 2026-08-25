@@ -45,43 +45,43 @@ polygon_dte_tol = 10  # +/- dias alrededor del tenor objetivo
 # PARAMETROS CONFIGURABLES
 # ================================================
 
-n_top_nasdaq = 200
-n_top_sp500 = 200
-n_top_int = 100
+n_top_nasdaq = 90
+n_top_sp500 = 90
+n_top_int = 50
 
-rebalance_months = [8]
+rebalance_months = [9]
 
-target_years = list(range(2014, 2026))
-mdd_start_year = 2014
+target_years = list(range(2019, 2026))
+mdd_start_year = 2019
 rf_rate = 0.046
 seed = 123
-max_weight = 0.18
+max_weight = 0.30
 n_sim = 5000
 target_total_tickers = 500
 
 lookback_months = None
 
-lambda_ = 2.5
-weight_sharpe = 0.4
-weight_low_vol = 0.35
-weight_decorr = 0.25
+lambda_ = 0.8
+weight_sharpe = 0.55
+weight_low_vol = 0.15
+weight_decorr = 0.30
 
-n_pre_seasonal = 60
-n_divers_candidates = 40
+n_pre_seasonal = 45
+n_divers_candidates = 30
 
 # Seleccion conjunta de candidatos (h_i / J_ij) via QUBO/Ising.
 # Por debajo del umbral: fuerza bruta (optimo exacto). Por encima: Simulated Annealing.
 qubo_exact_threshold = 2e6
 qubo_sa_iterations = 20000
 
-volatility_percentile = 0.60
-correlation_percentile = 0.65
+volatility_percentile = 0.85
+correlation_percentile = 0.85
 
 seasonal_min_weeks = 40
 
 # Umbral de exclusion estacional: si vol_estacional_anualizada / vol_general_anualizada
 # de un activo supera este multiplicador, se descarta (no se penaliza, se excluye)
-seasonal_vol_ratio_max = 1.35
+seasonal_vol_ratio_max = 1.80
 
 # Piso minimo de activos que deben sobrevivir al filtro estacional; si el umbral
 # deja menos que esto, se relaja tomando los siguientes mejores por ratio hasta alcanzarlo
@@ -109,15 +109,15 @@ min_observations = 24
 ideal_observations = 60
 
 use_delta_filter = True
-delta_min = 0.45
+delta_min = 0.30
 delta_strike_mode = "rf"
-iv_outlier_multiplier = 4.0
+iv_outlier_multiplier = 6.0
 
-max_region_weight = 0.60
+max_region_weight = 0.80
 
 # Porcentaje deseado de ETFs en el portafolio FINAL (resto queda en acciones individuales)
-pct_etf_deseado = 0.40     # ej. 15% ETFs / 85% acciones individuales
-pct_etf_tolerancia = 0.05  # banda +/- alrededor del porcentaje deseado
+pct_etf_deseado = 0.10     # ej. 15% ETFs / 85% acciones individuales
+pct_etf_tolerancia = 0.10  # banda +/- alrededor del porcentaje deseado
 
 # === VALIDACION DE PARAMETROS ===
 if not (1 <= len(rebalance_months) <= 3):

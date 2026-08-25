@@ -47,16 +47,16 @@ polygon_dte_tol = 10  # +/- dias alrededor del tenor objetivo
 
 n_top_nasdaq = 90
 n_top_sp500 = 90
-n_top_int = 30
+n_top_int = 50
 
 as_of_date = date.today()
-horizon_months = 3
+horizon_months = 2
 
 target_years = list(range(2014, 2026))
 mdd_start_year = 2014
 rf_rate = 0.047
 seed = 123
-max_weight = 0.18
+max_weight = 0.30
 n_sim = 5000
 target_total_tickers = 210
 
@@ -67,24 +67,24 @@ weight_sharpe = 0.55
 weight_low_vol = 0.15
 weight_decorr = 0.30
 
-n_pre_filter = 75
-n_filter_candidates = 45
+n_pre_filter = 45
+n_filter_candidates = 30
 
 qubo_exact_threshold = 2e6
 qubo_sa_iterations = 20000
 
 volatility_percentile = 0.85
-correlation_percentile = 0.75
+correlation_percentile = 0.85
 
 recent_vol_window_min_weeks = 13
-recent_vol_window_max_weeks = 26
-recent_vol_ratio_max = 1.35
-recent_vol_min_survivors = 18
+recent_vol_window_max_weeks = 18
+recent_vol_ratio_max = 1.80
+recent_vol_min_survivors = 14
 
 options_dte_cap_days = 90
 
-iv_vs_realized_ratio_max = 1.35
-iv_min_survivors = 14
+iv_vs_realized_ratio_max = 1.80
+iv_min_survivors = 10
 
 # === INTERVENCION 1: Parametros BKM (reemplaza filtro de skew 25-delta) ===
 bkm_moneyness_lo = 0.70          # limite inferior de moneyness K/S para strikes OTM (integracion BKM)
@@ -110,11 +110,11 @@ ideal_observations = 60
 use_delta_filter = True
 delta_min = 0.30
 delta_strike_mode = "atm"
-iv_outlier_multiplier = 5.0
+iv_outlier_multiplier = 6.0
 
-max_region_weight = 0.60
+max_region_weight = 0.80
 
-pct_etf_deseado = 0.15
+pct_etf_deseado = 0.10
 pct_etf_tolerancia = 0.1
 
 # === VALIDACION DE PARAMETROS ===
