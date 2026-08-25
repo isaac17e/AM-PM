@@ -4,6 +4,7 @@
 
 import os
 import time
+import webbrowser
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
@@ -15,21 +16,15 @@ import requests
 import plotly.graph_objects as go
 import yfinance as yf
 import warnings
-from IPython.display import display, HTML, clear_output
 
 warnings.filterwarnings("ignore")
 
 # ------------------------------------------------
 # API KEY - Polygon.io
 # ------------------------------------------------
-# >>> PEGA TU POLYGON API KEY AQUI (entre las comillas) <<<
-POLYGON_API_KEY = "NN"
-
-# Si prefieres no dejar la key escrita en el archivo, define la variable de
-# entorno POLYGON_API_KEY (en la terminal: export POLYGON_API_KEY="tu_key")
-# y deja la linea de arriba en blanco (""); se usara automaticamente.
-if not POLYGON_API_KEY:
-    POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
+from dotenv import load_dotenv
+load_dotenv()
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
 
 BASE_URL = "https://api.polygon.io"
 
@@ -76,6 +71,8 @@ PORTFOLIO_HOLDINGS = {
 REFRESH_SECONDS = 60
 MAX_ITERATIONS = None
 ROTATE_CAMERA = True
+OUTPUT_HTML_PATH = "portfolio_gex_field.html"
+OPEN_BROWSER_ON_START = True
 
 MIN_SIGMA_COVERAGE = 2.0
 MAX_STRIKE_RANGE_PCT = 0.35
@@ -885,6 +882,41 @@ def plot_3d_portfolio_field(X, Y, Z, current_state, reference_lines, portfolio_d
 
 
 # ============================================================
+# BLOQUE 9B: SALIDA HTML AUTORREFRESCANTE
+# ============================================================
+
+def write_portfolio_html(fig, output_path=OUTPUT_HTML_PATH, refresh_seconds=REFRESH_SECONDS):
+    if fig is None:
+        return
+
+    plot_div = fig.to_html(include_plotlyjs="cdn", full_html=False,
+                            config={"responsive": True, "displaylogo": False})
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    html = f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="{refresh_seconds}">
+<title>Portfolio GEX Potential Field</title>
+<style>
+  html, body {{ margin: 0; padding: 0; background: #0b0d10; color: #d8dee5;
+                font-family: -apple-system, "Segoe UI", sans-serif; }}
+  .footer {{ padding: 8px 16px; font-size: 12px; opacity: 0.65; }}
+</style>
+</head>
+<body>
+{plot_div}
+<div class="footer">Última actualización: {timestamp} — refresco automático cada {refresh_seconds}s</div>
+</body>
+</html>"""
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"💾 HTML actualizado: {os.path.abspath(output_path)}")
+
+
+# ============================================================
 # BLOQUE 10: EJECUCIÓN
 # ============================================================
 
@@ -910,15 +942,14 @@ def run_once():
 
 
 def run_live(refresh_seconds=REFRESH_SECONDS, max_iterations=MAX_ITERATIONS,
-             rotate_camera=ROTATE_CAMERA):
-    handle = None
+             rotate_camera=ROTATE_CAMERA, output_path=OUTPUT_HTML_PATH,
+             open_browser=OPEN_BROWSER_ON_START):
     angle = 0.0
     iteration = 0
 
     while max_iterations is None or iteration < max_iterations:
-        clear_output(wait=True)
-        print(f"🔄 Iteración {iteration + 1} | refrescando cada {refresh_seconds}s | "
-              f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
+        print(f"\n{'='*60}\n🔄 Iteración {iteration + 1} | refrescando cada {refresh_seconds}s | "
+              f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n{'='*60}\n")
 
         result = run_once()
 
@@ -936,7 +967,9 @@ def run_live(refresh_seconds=REFRESH_SECONDS, max_iterations=MAX_ITERATIONS,
                 result["portfolio_data"], camera_eye=camera_eye,
             )
             if fig is not None:
-                fig.show()
+                write_portfolio_html(fig, output_path, refresh_seconds)
+                if open_browser and iteration == 0:
+                    webbrowser.open(f"file://{os.path.abspath(output_path)}")
         else:
             print("⚠️  No se generó gráfico en esta iteración; se reintentará en el próximo refresh.")
 

@@ -33,14 +33,9 @@ investment_horizon_days = 30
 # ------------------------------------------------
 # API KEY - Polygon.io
 # ------------------------------------------------
-# >>> PEGA TU POLYGON API KEY AQUI (entre las comillas) <<<
-polygon_api_key = "NN"
-
-# Si prefieres no dejar la key escrita en el archivo, define la variable de
-# entorno POLYGON_API_KEY (en la terminal: export POLYGON_API_KEY="tu_key")
-# y deja la linea de arriba en blanco (""); se usara automaticamente.
-if not polygon_api_key:
-    polygon_api_key = os.environ.get("POLYGON_API_KEY")
+from dotenv import load_dotenv
+load_dotenv()
+polygon_api_key = os.environ.get("POLYGON_API_KEY")
 
 cash_reserve_limit      = 0.30
 

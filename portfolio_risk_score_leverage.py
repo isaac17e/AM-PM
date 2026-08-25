@@ -30,14 +30,9 @@ end_date = date.today()
 
 # --- API KEY DE POLYGON ---
 import os
-# >>> PEGA TU POLYGON API KEY AQUI (entre las comillas) <<<
-polygon_api_key = "NN"
-
-# Si prefieres no dejar la key escrita en el archivo, define la variable de
-# entorno POLYGON_API_KEY (en la terminal: export POLYGON_API_KEY="tu_key")
-# y deja la linea de arriba en blanco (""); se usara automaticamente.
-if not polygon_api_key:
-    polygon_api_key = os.environ.get("POLYGON_API_KEY")
+from dotenv import load_dotenv
+load_dotenv()
+polygon_api_key = os.environ.get("POLYGON_API_KEY")
 
 risk_free_rate_annual = 0.046
 confidence_levels = [0.95, 0.99]

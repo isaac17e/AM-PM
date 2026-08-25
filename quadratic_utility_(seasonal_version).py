@@ -27,11 +27,10 @@ import matplotlib.pyplot as plt
 # ------------------------------------------------
 # API KEY - Polygon.io
 # ------------------------------------------------
-POLYGON_API_KEY = "NN"
-
 import os
-if not POLYGON_API_KEY:
-    POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
+from dotenv import load_dotenv
+load_dotenv()
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
 
 if not POLYGON_API_KEY:
     print("ADVERTENCIA: No hay POLYGON_API_KEY configurada. Todas las consultas de opciones")
