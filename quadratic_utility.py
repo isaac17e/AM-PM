@@ -8,6 +8,7 @@ warnings.filterwarnings("ignore")
 import time
 import math
 import itertools
+import io
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
@@ -143,7 +144,7 @@ def safe_scrape_table(url, fallback=None, headers=None):
         headers = headers or {"User-Agent": "Mozilla/5.0 (compatible; PortfolioBot/1.0)"}
         resp = requests.get(url, headers=headers, timeout=20)
         resp.raise_for_status()
-        tables = pd.read_html(resp.text)
+        tables = pd.read_html(io.StringIO(resp.text))
         if not tables:
             return fallback
         return tables[0]
