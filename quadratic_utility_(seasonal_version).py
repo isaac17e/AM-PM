@@ -51,8 +51,8 @@ n_top_int = 50
 
 rebalance_months = [9]
 
-target_years = list(range(2019, 2026))
-mdd_start_year = 2019
+target_years = list(range(2016, 2026))
+mdd_start_year = 2016
 rf_rate = 0.046
 seed = 123
 max_weight = 0.30
@@ -77,7 +77,7 @@ qubo_sa_iterations = 20000
 volatility_percentile = 0.85
 correlation_percentile = 0.85
 
-seasonal_min_weeks = 40
+seasonal_min_weeks = 35
 
 # Umbral de exclusion estacional: si vol_estacional_anualizada / vol_general_anualizada
 # de un activo supera este multiplicador, se descarta (no se penaliza, se excluye)
