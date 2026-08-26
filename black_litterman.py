@@ -19,7 +19,8 @@ from scipy.optimize import minimize
 from scipy.interpolate import PchipInterpolator
 import quadprog
 
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # ------------------------------------------------
 # API KEY - Polygon.io
@@ -874,30 +875,6 @@ print(f"Sharpe Ratio:       {sharpe_mkt:.4f}")
 # BLOQUE 10: VISUALIZACION
 # =============================================================================
 
-fig, axes = plt.subplots(2, 2, figsize=(15, 11))
-
-ax = axes[0, 0]
-x = np.arange(n)
-width = 0.27
-ax.bar(x - width, comparacion["Pi_eq"], width, color="#4472C4", label="pi (Equilibrio)")
-ax.bar(x, comparacion["Mu_hist"], width, color="#FFC000", label="Historico")
-ax.bar(x + width, comparacion["Mu_BL_adj"], width, color="#ED7D31", label="mu_BL_adj (Posterior BKM)")
-ax.set_xticks(x)
-ax.set_xticklabels(comparacion["Ticker"], rotation=90, fontsize=8)
-ax.set_title(f"Retornos esperados - {etiqueta_horizonte}", fontweight="bold")
-ax.set_ylabel("Retorno esperado")
-ax.legend(fontsize=8)
-
-ax = axes[0, 1]
-ax.bar(x - width / 2, w_mkt, width, color="#4472C4", label="Mercado")
-ax.bar(x + width / 2, w_mvsk_vec, width, color="#70AD47", label=f"MVSK: {PERFIL_RIESGO.upper()}")
-ax.set_xticks(x)
-ax.set_xticklabels(tickers, rotation=90, fontsize=8)
-ax.set_title("Pesos: Mercado vs MVSK", fontweight="bold")
-ax.set_ylabel("Peso")
-ax.legend(fontsize=8)
-
-ax = axes[1, 0]
 sharpes_perfiles = {}
 for nm, pf in PERFILES.items():
     Om_sim = np.diag(np.diag(pf["tau"] * P_mat @ Sigma_mat @ P_mat.T)) * pf["omega_scale"]
@@ -922,25 +899,57 @@ for nm, pf in PERFILES.items():
 
 nombres_perfiles = ["conservador", "moderado", "agresivo"]
 valores_sharpe = [sharpes_perfiles[nm] for nm in nombres_perfiles]
-ax.bar(["Conservador", "Moderado", "Agresivo"], valores_sharpe,
-       color=["#70AD47", "#FFC000", "#ED7D31"])
-ax.axhline(sharpe_mkt, color="#4472C4", linestyle="--", linewidth=2, label="Mercado")
-ax.set_title("Sharpe por perfil de riesgo (MV, referencia)", fontweight="bold")
-ax.set_ylabel("Sharpe Ratio")
-ax.set_ylim(0, max(valores_sharpe) * 1.3)
-ax.legend(fontsize=8)
 
-ax = axes[1, 1]
 comp_sorted = comparacion.sort_values("Ajuste_BL")
 colores_ajuste = ["#70AD47" if v > 0 else "#ED7D31" for v in comp_sorted["Ajuste_BL"]]
-ax.bar(comp_sorted["Ticker"], comp_sorted["Ajuste_BL"], color=colores_ajuste)
-ax.axhline(0, color="black", linewidth=1.2)
-ax.set_xticklabels(comp_sorted["Ticker"], rotation=90, fontsize=8)
-ax.set_title("Ajuste mu_BL_adj vs pi (impacto de views + BKM)", fontweight="bold")
-ax.set_ylabel("mu_BL_adj - pi")
 
-plt.tight_layout()
-plt.show()
+fig = make_subplots(
+    rows=2, cols=2,
+    subplot_titles=(
+        f"Retornos esperados - {etiqueta_horizonte}",
+        "Pesos: Mercado vs MVSK",
+        "Sharpe por perfil de riesgo (MV, referencia)",
+        "Ajuste mu_BL_adj vs pi (impacto de views + BKM)",
+    ),
+)
+
+fig.add_trace(go.Bar(x=comparacion["Ticker"], y=comparacion["Pi_eq"], name="pi (Equilibrio)",
+                      marker_color="#4472C4"), row=1, col=1)
+fig.add_trace(go.Bar(x=comparacion["Ticker"], y=comparacion["Mu_hist"], name="Historico",
+                      marker_color="#FFC000"), row=1, col=1)
+fig.add_trace(go.Bar(x=comparacion["Ticker"], y=comparacion["Mu_BL_adj"], name="mu_BL_adj (Posterior BKM)",
+                      marker_color="#ED7D31"), row=1, col=1)
+
+fig.add_trace(go.Bar(x=tickers, y=w_mkt, name="Mercado", marker_color="#4472C4"), row=1, col=2)
+fig.add_trace(go.Bar(x=tickers, y=w_mvsk_vec, name=f"MVSK: {PERFIL_RIESGO.upper()}",
+                      marker_color="#70AD47"), row=1, col=2)
+
+fig.add_trace(go.Bar(x=["Conservador", "Moderado", "Agresivo"], y=valores_sharpe,
+                      marker_color=["#70AD47", "#FFC000", "#ED7D31"], showlegend=False,
+                      name="Sharpe"), row=2, col=1)
+fig.add_hline(y=sharpe_mkt, line_dash="dash", line_color="#4472C4",
+              annotation_text="Mercado", annotation_position="top left", row=2, col=1)
+
+fig.add_trace(go.Bar(x=comp_sorted["Ticker"], y=comp_sorted["Ajuste_BL"], marker_color=colores_ajuste,
+                      showlegend=False, name="Ajuste BL"), row=2, col=2)
+fig.add_hline(y=0, line_color="black", row=2, col=2)
+
+fig.update_xaxes(tickangle=90, row=1, col=1)
+fig.update_xaxes(tickangle=90, row=1, col=2)
+fig.update_xaxes(tickangle=90, row=2, col=2)
+fig.update_yaxes(title_text="Retorno esperado", row=1, col=1)
+fig.update_yaxes(title_text="Peso", row=1, col=2)
+fig.update_yaxes(title_text="Sharpe Ratio", range=[0, max(valores_sharpe) * 1.3], row=2, col=1)
+fig.update_yaxes(title_text="mu_BL_adj - pi", row=2, col=2)
+
+fig.update_layout(
+    title=f"Vision General Black-Litterman - {etiqueta_horizonte}",
+    barmode="group",
+    template="plotly_white",
+    height=900,
+    legend=dict(orientation="h", yanchor="bottom", y=1.08, xanchor="center", x=0.5),
+)
+fig.show()
 
 # =============================================================================
 # BLOQUE 11: MAXIMUM DRAWDOWN (MDD) DEL PORTAFOLIO MVSK
@@ -1057,26 +1066,29 @@ if precios_mdd is not None and len(precios_mdd) >= 10:
     plot_data["mdd_pct"] = plot_data["mdd"] * 100
     plot_data["con_dato"] = plot_data["mdd_pct"].notna()
 
-    fig, ax = plt.subplots(figsize=(11, 6))
-    ax.plot(plot_data["year"], plot_data["mdd_pct"], color="darkred", linewidth=1.5)
-    colors = plot_data["con_dato"].map({True: "darkred", False: "gray"})
-    ax.scatter(plot_data["year"], plot_data["mdd_pct"], c=colors, s=40, zorder=3)
-    ax.axhline(mdd_mediana * 100, linestyle="--", color="steelblue", linewidth=1.2)
-    ax.axhline(mdd_p90 * 100, linestyle="--", color="darkorange", linewidth=1.2)
-    ax.text(plot_data["year"].min() + 0.2, mdd_mediana * 100 + 0.3,
-            f"Mediana: {mdd_mediana * 100:.2f}%", color="steelblue", fontsize=9)
-    ax.text(plot_data["year"].min() + 0.2, mdd_p90 * 100 + 0.3,
-            f"P90: {mdd_p90 * 100:.2f}%", color="darkorange", fontsize=9)
-    ax.set_xticks(range(MDD_START_YEAR, date.today().year + 1))
-    plt.xticks(rotation=45)
-    ax.set_title("Maximum Drawdown Historico - Portafolio MVSK (BL + BKM)", fontweight="bold", fontsize=13)
-    ax.set_xlabel("Ano")
-    ax.set_ylabel("MDD (%)")
-    plt.suptitle(f"Perfil: {PERFIL_RIESGO.upper()} | Horizonte: {etiqueta_horizonte} | "
-                 f"MDD global ({MDD_START_YEAR}-hoy): {mdd_global * 100:.2f}% | "
-                 f"{int(plot_data['con_dato'].sum())} anos con datos", fontsize=9, y=0.96)
-    plt.tight_layout()
-    plt.show()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=plot_data["year"], y=plot_data["mdd_pct"], mode="lines+markers",
+        line=dict(color="darkred", width=1.5),
+        marker=dict(color=plot_data["con_dato"].map({True: "darkred", False: "gray"}), size=8),
+        hovertemplate="Ano %{x}: %{y:.2f}%<extra></extra>", showlegend=False,
+    ))
+    fig.add_hline(y=mdd_mediana * 100, line_dash="dash", line_color="steelblue",
+                  annotation_text=f"Mediana: {mdd_mediana * 100:.2f}%", annotation_position="top left",
+                  annotation_font_color="steelblue")
+    fig.add_hline(y=mdd_p90 * 100, line_dash="dash", line_color="darkorange",
+                  annotation_text=f"P90: {mdd_p90 * 100:.2f}%", annotation_position="bottom left",
+                  annotation_font_color="darkorange")
+    fig.update_layout(
+        title=dict(text="Maximum Drawdown Historico - Portafolio MVSK (BL + BKM)<br>"
+                         f"<sup>Perfil: {PERFIL_RIESGO.upper()} | Horizonte: {etiqueta_horizonte} | "
+                         f"MDD global ({MDD_START_YEAR}-hoy): {mdd_global * 100:.2f}% | "
+                         f"{int(plot_data['con_dato'].sum())} anos con datos</sup>"),
+        xaxis_title="Ano", yaxis_title="MDD (%)",
+        xaxis=dict(tickmode="linear", tick0=MDD_START_YEAR, dtick=1, tickangle=45),
+        template="plotly_white",
+    )
+    fig.show()
     print("  Grafico de MDD generado.")
 
 else:

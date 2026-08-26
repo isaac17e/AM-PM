@@ -26,6 +26,8 @@ from scipy.stats import norm
 import quadprog
 
 import matplotlib.pyplot as plt
+import plotly.express as px
+import plotly.graph_objects as go
 
 # ------------------------------------------------
 # API KEY - Polygon.io
@@ -2154,23 +2156,29 @@ x_max = max(risk_vals.max(), sd_opt) * 1.15
 y_min = min(returns_vals.min(), ret_opt) * 0.95
 y_max = max(returns_vals.max(), ret_opt) * 1.10
 
-fig, ax = plt.subplots(figsize=(9, 6))
-sc = ax.scatter(frontier_df["risk"], frontier_df["ret"], c=frontier_df["utility"],
-                cmap="RdYlGn", alpha=0.3, s=15)
-plt.colorbar(sc, label=f"Utilidad\n(lambda={lambda_:.1f})")
-ax.plot(efficient_points["risk"], efficient_points["ret"], color="darkgreen", linestyle="--", linewidth=1.5)
-ax.scatter([opt_point["risk"][0]], [opt_point["ret"][0]], color="red", s=120, marker="D", zorder=5)
-ax.annotate(f"Optimo\nU={opt_point['utility'][0]:.4f}", (opt_point["risk"][0], opt_point["ret"][0]),
-            textcoords="offset points", xytext=(8, 8), fontsize=9, fontweight="bold")
-ax.set_xlim(0, x_max)
-ax.set_ylim(y_min, y_max)
-ax.set_title("Frontera Eficiente - Utilidad Cuadratica", fontweight="bold", fontsize=14)
-ax.set_xlabel(f"Riesgo ({horizon_months} meses)")
-ax.set_ylabel(f"Retorno Esperado ({horizon_months} meses)")
-plt.suptitle(f"Horizonte: {horizon_months} mes(es) ({horizon_label}) | lambda={lambda_:.2f} | "
-             f"{min(target_years)}-{max(target_years)}", y=0.94, fontsize=10)
-plt.tight_layout()
-plt.show()
+fig = px.scatter(
+    frontier_df, x="risk", y="ret", color="utility", opacity=0.35,
+    color_continuous_scale="RdYlGn",
+    labels={"risk": f"Riesgo ({horizon_months} meses)", "ret": f"Retorno Esperado ({horizon_months} meses)",
+            "utility": f"Utilidad<br>(lambda={lambda_:.1f})"},
+)
+fig.update_traces(marker=dict(size=6), hovertemplate="Riesgo: %{x:.4f}<br>Retorno: %{y:.4f}<br>Utilidad: %{marker.color:.4f}<extra></extra>")
+fig.add_trace(go.Scatter(x=efficient_points["risk"], y=efficient_points["ret"], mode="lines",
+                          line=dict(color="darkgreen", dash="dash", width=1.5),
+                          name="Frontera eficiente"))
+fig.add_trace(go.Scatter(x=[opt_point["risk"][0]], y=[opt_point["ret"][0]], mode="markers",
+                          marker=dict(color="red", size=14, symbol="diamond", line=dict(width=1, color="black")),
+                          name=f"Optimo (U={opt_point['utility'][0]:.4f})",
+                          hovertemplate=f"Optimo<br>Riesgo: %{{x:.4f}}<br>Retorno: %{{y:.4f}}<br>"
+                                        f"U={opt_point['utility'][0]:.4f}<extra></extra>"))
+fig.update_layout(
+    title=dict(text="Frontera Eficiente - Utilidad Cuadratica<br>"
+                     f"<sup>Horizonte: {horizon_months} mes(es) ({horizon_label}) | lambda={lambda_:.2f} | "
+                     f"{min(target_years)}-{max(target_years)}</sup>"),
+    xaxis_range=[0, x_max], yaxis_range=[y_min, y_max],
+    template="plotly_white",
+)
+fig.show()
 
 # ================================================
 # COMPARACION DE LAMBDAS
@@ -2210,24 +2218,30 @@ if len(results_comparison) > 0:
         disp[col] = disp[col].map(lambda x: f"{x:.4f}")
     print(disp.to_string(index=False))
 
-    fig, ax = plt.subplots(figsize=(9, 6))
-    ax.plot(results_comparison["volatilidad"], results_comparison["retorno"],
-            color="steelblue", alpha=0.6, linewidth=1.5)
-    sc = ax.scatter(results_comparison["volatilidad"], results_comparison["retorno"],
-                     c=results_comparison["utilidad"], cmap="RdYlGn",
-                     s=results_comparison["lambda_"] * 15 + 40)
-    for _, row in results_comparison.iterrows():
-        ax.annotate(f"{row['lambda_']:.1f}", (row["volatilidad"], row["retorno"]),
-                    textcoords="offset points", xytext=(6, 0), fontsize=8)
-    plt.colorbar(sc, label="Utilidad")
-    ax.set_title("Frontera de Portafolios por Nivel de Aversion al Riesgo", fontweight="bold", fontsize=13)
-    ax.set_xlabel("Volatilidad (%)")
-    ax.set_ylabel("Retorno Esperado (%)")
-    plt.figtext(0.5, -0.02, "lambda bajo = Agresivo | lambda alto = Conservador", ha="center", fontsize=9)
-    plt.suptitle(f"Horizonte: {horizon_months} mes(es) ({horizon_label}) | {min(target_years)}-{max(target_years)}",
-                 y=0.96, fontsize=10)
-    plt.tight_layout()
-    plt.show()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=results_comparison["volatilidad"], y=results_comparison["retorno"], mode="lines",
+                              line=dict(color="steelblue", width=1.5), opacity=0.6,
+                              showlegend=False, hoverinfo="skip"))
+    bubble_fig = px.scatter(
+        results_comparison, x="volatilidad", y="retorno", color="utilidad", size="lambda_",
+        color_continuous_scale="RdYlGn", size_max=22,
+        text=results_comparison["lambda_"].map(lambda x: f"{x:.1f}"),
+        labels={"volatilidad": "Volatilidad (%)", "retorno": "Retorno Esperado (%)", "utilidad": "Utilidad"},
+        hover_data={"lambda_": ":.1f", "sharpe": ":.3f", "n_activos": True, "max_peso": ":.1f",
+                    "volatilidad": ":.2f", "retorno": ":.2f", "utilidad": ":.4f"},
+    )
+    bubble_fig.update_traces(textposition="middle right", textfont_size=9)
+    for trace in bubble_fig.data:
+        fig.add_trace(trace)
+    fig.update_layout(bubble_fig.layout)
+    fig.update_layout(
+        title=dict(text="Frontera de Portafolios por Nivel de Aversion al Riesgo<br>"
+                         f"<sup>Horizonte: {horizon_months} mes(es) ({horizon_label}) | "
+                         f"{min(target_years)}-{max(target_years)} | "
+                         "lambda bajo = Agresivo, lambda alto = Conservador</sup>"),
+        template="plotly_white",
+    )
+    fig.show()
 
     best_row = results_comparison.loc[results_comparison["utilidad"].idxmax()]
     print("\n" + "=" * 70)
@@ -2364,28 +2378,30 @@ if len(yearly_mdd_valid) >= 1:
     plot_data = yearly_mdd.copy()
     plot_data["mdd_pct"] = np.where(plot_data["has_data"], plot_data["mdd"] * 100, np.nan)
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(plot_data["year"], plot_data["mdd_pct"], color="darkred", linewidth=1.5)
-    colors = plot_data["has_data"].map({True: "darkred", False: "gray"})
-    ax.scatter(plot_data["year"], plot_data["mdd_pct"], c=colors, s=40)
-
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=plot_data["year"], y=plot_data["mdd_pct"], mode="lines+markers",
+        line=dict(color="darkred", width=1.5),
+        marker=dict(color=plot_data["has_data"].map({True: "darkred", False: "gray"}), size=8),
+        hovertemplate="Ano %{x}: %{y:.2f}%<extra></extra>", showlegend=False,
+    ))
     if len(yearly_mdd_valid) >= 3:
-        ax.axhline(median_mdd * 100, linestyle="--", color="blue", linewidth=1.2)
-        ax.axhline(p90_mdd * 100, linestyle="--", color="orange", linewidth=1.2)
-        ax.text(yearly_mdd["year"].min() + 2, median_mdd * 100 - 0.3, f"Mediana: {median_mdd * 100:.2f}%",
-                color="blue", fontsize=9)
-        ax.text(yearly_mdd["year"].min() + 2, p90_mdd * 100 - 0.3, f"P90: {p90_mdd * 100:.2f}%",
-                color="orange", fontsize=9)
-
-    ax.set_title("Maximum Drawdown Historico del Portafolio", fontweight="bold", fontsize=14)
-    ax.set_xlabel("Ano")
-    ax.set_ylabel("MDD (%)")
-    ax.set_xticks(range(mdd_start_year, max(target_years) + 1, 2))
-    plt.xticks(rotation=45)
-    plt.suptitle(f"Horizonte: {horizon_months} mes(es) ({horizon_label}) | MDD: {mdd_start_year}-{max(target_years)} | "
-                 f"{int(yearly_mdd['has_data'].sum())} anos con datos", y=0.96, fontsize=10)
-    plt.tight_layout()
-    plt.show()
+        fig.add_hline(y=median_mdd * 100, line_dash="dash", line_color="blue",
+                      annotation_text=f"Mediana: {median_mdd * 100:.2f}%", annotation_position="top left",
+                      annotation_font_color="blue")
+        fig.add_hline(y=p90_mdd * 100, line_dash="dash", line_color="orange",
+                      annotation_text=f"P90: {p90_mdd * 100:.2f}%", annotation_position="bottom left",
+                      annotation_font_color="orange")
+    fig.update_layout(
+        title=dict(text="Maximum Drawdown Historico del Portafolio<br>"
+                         f"<sup>Horizonte: {horizon_months} mes(es) ({horizon_label}) | "
+                         f"MDD: {mdd_start_year}-{max(target_years)} | "
+                         f"{int(yearly_mdd['has_data'].sum())} anos con datos</sup>"),
+        xaxis_title="Ano", yaxis_title="MDD (%)",
+        xaxis=dict(tickmode="linear", tick0=mdd_start_year, dtick=2, tickangle=45),
+        template="plotly_white",
+    )
+    fig.show()
 
     yearly_summary = yearly_mdd.sort_values("year", ascending=False).copy()
     yearly_summary["MDD"] = np.where(yearly_summary["has_data"],

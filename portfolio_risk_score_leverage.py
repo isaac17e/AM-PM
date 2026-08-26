@@ -781,11 +781,9 @@ def run_leverage_module(expost_results, options_module, weights,
 # =============================================================================
 # BLOQUE 7: REPORTE Y GRAFICOS
 # =============================================================================
-import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
-import seaborn as sns
-
-sns.set_theme(style="whitegrid")
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 def print_executive_summary(expost_results, options_module, leverage_results):
     print("\n\n================ RESUMEN EJECUTIVO ================\n")
@@ -818,14 +816,18 @@ def plot_pcr_vs_weight(risk_contribution):
     df = risk_contribution[["Activo", "Peso", "PCR"]].melt(
         id_vars="Activo", var_name="Metrica", value_name="Valor"
     )
-    fig, ax = plt.subplots(figsize=(8, 5))
-    sns.barplot(data=df, x="Activo", y="Valor", hue="Metrica",
-                palette={"Peso": "#4C72B0", "PCR": "#DD8452"}, ax=ax)
-    ax.yaxis.set_major_formatter(mticker.PercentFormatter(1.0))
-    ax.set_title("Contribucion Porcentual al Riesgo (PCR) vs. Peso Invertido")
-    ax.set_xlabel(None)
-    ax.set_ylabel(None)
-    plt.tight_layout()
+    fig = px.bar(
+        df, x="Activo", y="Valor", color="Metrica", barmode="group",
+        color_discrete_map={"Peso": "#4C72B0", "PCR": "#DD8452"},
+        labels={"Valor": "", "Activo": ""},
+    )
+    fig.update_traces(hovertemplate="%{x}: %{y:.2%}<extra></extra>")
+    fig.update_layout(
+        title="Contribucion Porcentual al Riesgo (PCR) vs. Peso Invertido",
+        yaxis_tickformat=".0%",
+        template="plotly_white",
+        legend_title_text="",
+    )
     return fig
 
 def plot_gex_profile(options_by_asset):
@@ -843,19 +845,20 @@ def plot_gex_profile(options_by_asset):
 
     gex_all = pd.concat(frames, ignore_index=True)
     tickers_ = gex_all["Activo"].unique()
-    fig, axes = plt.subplots(1, len(tickers_), figsize=(6 * len(tickers_), 5), squeeze=False)
+    fig = make_subplots(rows=1, cols=len(tickers_), subplot_titles=list(tickers_))
     for i, tk in enumerate(tickers_):
-        ax = axes[0][i]
         sub = gex_all[gex_all["Activo"] == tk]
         colors = ["#55A868" if v > 0 else "#C44E52" for v in sub["GEX_neto"]]
-        width = (sub["strike"].max() - sub["strike"].min()) / max(len(sub), 1) * 0.8
-        ax.bar(sub["strike"], sub["GEX_neto"], color=colors, width=width if width > 0 else 1)
-        ax.axhline(0, linewidth=0.5, color="black")
-        ax.set_title(tk)
-        ax.set_xlabel("Strike")
-        ax.set_ylabel("GEX Neto ($)")
-    fig.suptitle("Perfil de Gamma Exposure (GEX) por Strike")
-    plt.tight_layout()
+        fig.add_trace(go.Bar(x=sub["strike"], y=sub["GEX_neto"], marker_color=colors, showlegend=False,
+                              hovertemplate="Strike %{x}: $%{y:,.0f}<extra></extra>"), row=1, col=i + 1)
+        fig.add_hline(y=0, line_color="black", line_width=0.5, row=1, col=i + 1)
+        fig.update_xaxes(title_text="Strike", row=1, col=i + 1)
+        fig.update_yaxes(title_text="GEX Neto ($)", row=1, col=i + 1)
+    fig.update_layout(
+        title="Perfil de Gamma Exposure (GEX) por Strike",
+        template="plotly_white",
+        width=max(600, 500 * len(tickers_)),
+    )
     return fig
 
 def plot_loss_distribution(portfolio_returns, var_es_row):
@@ -863,39 +866,50 @@ def plot_loss_distribution(portfolio_returns, var_es_row):
     cvar95 = var_es_row["CVaR_Hist_95_Diario"].values[0]
     var99 = var_es_row["VaR_Hist_99_Diario"].values[0]
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    sns.histplot(portfolio_returns, bins=60, stat="density", color="#4C72B0", alpha=0.7, ax=ax)
-    sns.kdeplot(portfolio_returns, color="black", linewidth=0.6, ax=ax)
-    ax.axvline(-var95, color="#DD8452", linestyle="--", linewidth=0.8)
-    ax.axvline(-cvar95, color="#C44E52", linestyle="--", linewidth=0.8)
-    ax.axvline(-var99, color="#8172B2", linestyle=":", linewidth=0.8)
-    ylim_top = ax.get_ylim()[1]
-    ax.text(-var95, ylim_top, "VaR 95%", rotation=90, va="top", ha="right", fontsize=8)
-    ax.text(-cvar95, ylim_top, "CVaR 95%", rotation=90, va="top", ha="right", fontsize=8)
-    ax.text(-var99, ylim_top, "VaR 99%", rotation=90, va="bottom", ha="right", fontsize=8)
-    ax.set_title("Distribucion de Retornos Diarios del Portafolio")
-    ax.set_xlabel("Retorno diario")
-    ax.set_ylabel("Densidad")
-    plt.tight_layout()
+    port_vals = np.asarray(portfolio_returns, dtype=float)
+    df_ret = pd.DataFrame({"retorno": port_vals})
+
+    fig = px.histogram(
+        df_ret, x="retorno", nbins=60, histnorm="probability density",
+        color_discrete_sequence=["#4C72B0"], opacity=0.7,
+        labels={"retorno": "Retorno diario"},
+    )
+    fig.update_traces(hovertemplate="Retorno: %{x:.4f}<br>Densidad: %{y:.2f}<extra></extra>")
+
+    kde = stats.gaussian_kde(port_vals)
+    x_kde = np.linspace(port_vals.min(), port_vals.max(), 300)
+    fig.add_trace(go.Scatter(x=x_kde, y=kde(x_kde), mode="lines", line=dict(color="black", width=1.2),
+                              name="Densidad (KDE)", hoverinfo="skip"))
+
+    fig.add_vline(x=-var95, line_dash="dash", line_color="#DD8452",
+                  annotation_text="VaR 95%", annotation_textangle=-90)
+    fig.add_vline(x=-cvar95, line_dash="dash", line_color="#C44E52",
+                  annotation_text="CVaR 95%", annotation_textangle=-90)
+    fig.add_vline(x=-var99, line_dash="dot", line_color="#8172B2",
+                  annotation_text="VaR 99%", annotation_textangle=-90)
+
+    fig.update_layout(
+        title="Distribucion de Retornos Diarios del Portafolio",
+        xaxis_title="Retorno diario", yaxis_title="Densidad",
+        template="plotly_white", showlegend=False,
+    )
     return fig
 
 def plot_leverage_assignment(leverage_summary, leverage_min, leverage_max):
     df = leverage_summary.sort_values("Apalancamiento")
-    fig, ax = plt.subplots(figsize=(8, 5))
-    norm_ = plt.Normalize(df["Risk_Score"].min(), df["Risk_Score"].max())
-    cmap = plt.get_cmap("RdYlGn_r")
-    colors = cmap(norm_(df["Risk_Score"]))
-    bars = ax.bar(df["Activo"], df["Apalancamiento"], color=colors)
-    for bar, val in zip(bars, df["Apalancamiento"]):
-        ax.text(bar.get_x() + bar.get_width() / 2, val, f"x{val:.2f}",
-                ha="center", va="bottom", fontsize=9)
-    ax.set_ylim(0, leverage_max * 1.15)
-    ax.set_title(f"Apalancamiento Asignado por Activo (x{leverage_min:.1f} - x{leverage_max:.1f})")
-    ax.set_ylabel("Apalancamiento")
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm_)
-    sm.set_array([])
-    fig.colorbar(sm, ax=ax, label="Risk Score")
-    plt.tight_layout()
+    fig = px.bar(
+        df, x="Activo", y="Apalancamiento", color="Risk_Score",
+        color_continuous_scale="RdYlGn_r",
+        text=df["Apalancamiento"].map(lambda x: f"x{x:.2f}"),
+        labels={"Risk_Score": "Risk Score"},
+    )
+    fig.update_traces(textposition="outside",
+                       hovertemplate="%{x}: x%{y:.2f} (Risk Score: %{marker.color:.2f})<extra></extra>")
+    fig.update_layout(
+        title=f"Apalancamiento Asignado por Activo (x{leverage_min:.1f} - x{leverage_max:.1f})",
+        yaxis_title="Apalancamiento", yaxis_range=[0, leverage_max * 1.15],
+        template="plotly_white",
+    )
     return fig
 
 def run_reporting_module(expost_results, options_module, leverage_results,
@@ -918,7 +932,7 @@ def run_reporting_module(expost_results, options_module, leverage_results,
 
     for p in plots.values():
         if p is not None:
-            plt.show()
+            p.show()
 
     return plots
 

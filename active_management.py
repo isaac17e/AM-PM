@@ -12,8 +12,7 @@ import numpy as np
 import pandas as pd
 import requests
 from scipy.stats import norm
-import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
+import plotly.graph_objects as go
 
 # ============================================================================
 # BLOQUE 1: PARAMETROS CONFIGURABLES
@@ -683,63 +682,53 @@ def plot_gamma_profile(analysis):
     flip = analysis["gex"]["gex_flip_level"]
     em = analysis["expected_move"]
 
-    fig, ax = plt.subplots(figsize=(9, 5))
-
     colors = [gamma_profile_colors["positivo"] if v > 0 else gamma_profile_colors["negativo"]
               for v in gex_df["net_gex"]]
-    strikes = gex_df["strike"].values
-    width = (strikes.max() - strikes.min()) / max(len(strikes), 1) * 0.8 if len(strikes) > 1 else 1
 
-    ax.bar(strikes, gex_df["net_gex"] / 1e6, width=width, color=colors)
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=gex_df["strike"], y=gex_df["net_gex"] / 1e6, marker_color=colors,
+                          showlegend=False, hovertemplate="Strike %{x}: %{y:.2f} $MM<extra></extra>"))
 
-    ax.axvline(spot, color="black", linestyle="-", linewidth=0.8)
-    ax.text(spot, ax.get_ylim()[1], f"Spot: {spot:.2f}", va="top", ha="left", fontsize=9)
+    fig.add_vline(x=spot, line_color="black", annotation_text=f"Spot: {spot:.2f}",
+                  annotation_position="top left")
 
     if pd.notna(flip):
-        ax.axvline(flip, color=gamma_profile_colors["flip"], linestyle="--", linewidth=0.8)
-        ax.text(flip, ax.get_ylim()[0], f"Flip: {flip:.2f}", va="bottom", ha="left",
-                fontsize=9, color=gamma_profile_colors["flip"])
+        fig.add_vline(x=flip, line_color=gamma_profile_colors["flip"], line_dash="dash",
+                      annotation_text=f"Flip: {flip:.2f}", annotation_position="bottom left",
+                      annotation_font_color=gamma_profile_colors["flip"])
 
     if em is not None:
-        ax.axvspan(em["lower_bound"], em["upper_bound"], color="orange", alpha=0.08)
+        fig.add_vrect(x0=em["lower_bound"], x1=em["upper_bound"], fillcolor="orange",
+                      opacity=0.08, line_width=0)
 
-    ax.set_title(f"{analysis['ticker']} — Perfil de Exposicion Gamma (GEX)", fontweight="bold")
-    ax.set_xlabel("Strike")
-    ax.set_ylabel("Net GEX ($MM por 1% de movimiento)")
-    ax.text(0.5, 1.06, f"Expiracion: {analysis['expiration']} | Regimen: {analysis['gex']['gex_regime']}",
-            transform=ax.transAxes, ha="center", fontsize=9)
-
-    fig.tight_layout()
+    fig.update_layout(
+        title=dict(text=f"{analysis['ticker']} — Perfil de Exposicion Gamma (GEX)<br>"
+                         f"<sup>Expiracion: {analysis['expiration']} | "
+                         f"Regimen: {analysis['gex']['gex_regime']}</sup>"),
+        xaxis_title="Strike", yaxis_title="Net GEX ($MM por 1% de movimiento)",
+        template="plotly_white",
+    )
     return fig
 
 
 def plot_allocation_comparison(tabla_rebalanceo):
     df = tabla_rebalanceo[["Ticker", "Peso_Inicial", "Nuevo_Peso"]].copy()
-    tickers = df["Ticker"].tolist()
-    x = np.arange(len(tickers))
-    width = 0.35
 
-    fig, ax = plt.subplots(figsize=(9, 5))
-    actual_vals = df["Peso_Inicial"].values
-    sugerido_vals = df["Nuevo_Peso"].values
-
-    bars1 = ax.bar(x - width/2, actual_vals, width, label="Actual", color=allocation_colors["Actual"])
-    bars2 = ax.bar(x + width/2, sugerido_vals, width, label="Sugerido", color=allocation_colors["Sugerido"])
-
-    for bars in (bars1, bars2):
-        for b in bars:
-            h = b.get_height()
-            ax.annotate(f"{h*100:.1f}%", xy=(b.get_x() + b.get_width()/2, h),
-                        xytext=(0, 3), textcoords="offset points", ha="center", fontsize=8)
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(tickers)
-    ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
-    ax.set_title("Cambios en la Asignacion del Portafolio", fontweight="bold")
-    ax.set_ylabel("Peso del Portafolio")
-    ax.legend(loc="upper center", ncol=2, bbox_to_anchor=(0.5, 1.12))
-
-    fig.tight_layout()
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=df["Ticker"], y=df["Peso_Inicial"], name="Actual",
+                          marker_color=allocation_colors["Actual"],
+                          text=df["Peso_Inicial"].map(lambda x: f"{x * 100:.1f}%"), textposition="outside",
+                          hovertemplate="%{x} Actual: %{y:.2%}<extra></extra>"))
+    fig.add_trace(go.Bar(x=df["Ticker"], y=df["Nuevo_Peso"], name="Sugerido",
+                          marker_color=allocation_colors["Sugerido"],
+                          text=df["Nuevo_Peso"].map(lambda x: f"{x * 100:.1f}%"), textposition="outside",
+                          hovertemplate="%{x} Sugerido: %{y:.2%}<extra></extra>"))
+    fig.update_layout(
+        title="Cambios en la Asignacion del Portafolio",
+        yaxis_title="Peso del Portafolio", yaxis_tickformat=".0%",
+        barmode="group", template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+    )
     return fig
 
 # ============================================================================
@@ -782,11 +771,9 @@ def run_active_management_engine(portfolio, horizon_days, api_key, cash_limit):
 resultado = run_active_management_engine(portfolio, investment_horizon_days, polygon_api_key, cash_reserve_limit)
 
 for tk, fig in resultado["gamma_plots"].items():
-    plt.figure(fig.number)
-    plt.show()
+    fig.show()
 
-plt.figure(resultado["allocation_plot"].number)
-plt.show()
+resultado["allocation_plot"].show()
 
 print("\n-- Tabla de Rebalanceo (data.frame crudo) --")
 print(resultado["tabla_rebalanceo"])

@@ -22,7 +22,8 @@ from scipy.cluster.hierarchy import linkage, leaves_list
 from scipy.spatial.distance import squareform
 import quadprog
 
-import matplotlib.pyplot as plt
+import plotly.express as px
+import plotly.graph_objects as go
 
 # ------------------------------------------------
 # API KEY - Polygon.io
@@ -1874,29 +1875,46 @@ asset_metrics = pd.DataFrame({
     "Risk": sd_ret.values * horizon_sqrt,
 })
 
-fig, ax = plt.subplots(figsize=(10, 7))
-if len(efficient_frontier) > 0:
-    ef_sorted = efficient_frontier.sort_values("Risk")
-    ax.plot(ef_sorted["Risk"], ef_sorted["Return"], color="#08519c", linewidth=2, alpha=0.9)
-    ax.scatter(efficient_frontier["Risk"], efficient_frontier["Return"], color="#08519c", s=25, alpha=0.5)
-ax.scatter(df_points["Risk"], df_points["Return"], marker="o", s=250, edgecolor="black",
-           linewidth=1.5, facecolor="#2ca25f", zorder=5)
-for _, row in df_points.iterrows():
-    ax.annotate(row["Label"], (row["Risk"], row["Return"]), textcoords="offset points",
-                xytext=(0, 12), ha="center", fontweight="bold", fontsize=9)
-ax.scatter(asset_metrics["Risk"], asset_metrics["Return"], color="#ff7f00", s=45, alpha=0.7)
-for _, row in asset_metrics.iterrows():
-    ax.annotate(row["Symbol"], (row["Risk"], row["Return"]), textcoords="offset points",
-                xytext=(0, -12), ha="center", fontsize=7, fontweight="bold")
-ax.set_title("Frontera Eficiente - Minima Varianza", fontweight="bold", fontsize=15)
-ax.set_xlabel(f"Riesgo acumulado horizonte ({horizon_label})")
-ax.set_ylabel(f"Retorno esperado acumulado ({horizon_label})")
-ax.xaxis.set_major_formatter(plt.matplotlib.ticker.PercentFormatter(xmax=1))
-ax.yaxis.set_major_formatter(plt.matplotlib.ticker.PercentFormatter(xmax=1))
-plt.suptitle(f"Horizonte: {horizon_label} (~{horizon_weeks:.1f} sem) | Periodo datos: {start_date} -> "
-             f"{end_date:%Y-%m-%d} | {len(selected_tickers)} activos", y=0.94, fontsize=9)
-plt.tight_layout()
-plt.show()
+ef_sorted = efficient_frontier.sort_values("Risk") if len(efficient_frontier) > 0 else efficient_frontier
+frontier_plot_df = pd.DataFrame({
+    "Nombre": "Frontera eficiente", "Categoria": "Frontera eficiente",
+    "Risk": ef_sorted["Risk"], "Return": ef_sorted["Return"],
+}) if len(ef_sorted) > 0 else pd.DataFrame(columns=["Nombre", "Categoria", "Risk", "Return"])
+activos_plot_df = pd.DataFrame({
+    "Nombre": asset_metrics["Symbol"], "Categoria": "Activos individuales",
+    "Risk": asset_metrics["Risk"], "Return": asset_metrics["Return"],
+})
+optimo_plot_df = pd.DataFrame({
+    "Nombre": df_points["Label"], "Categoria": "Portafolio optimo",
+    "Risk": df_points["Risk"], "Return": df_points["Return"],
+})
+
+fig = px.scatter(
+    pd.concat([frontier_plot_df, activos_plot_df, optimo_plot_df], ignore_index=True),
+    x="Risk", y="Return", color="Categoria", hover_name="Nombre",
+    color_discrete_map={
+        "Frontera eficiente": "#08519c",
+        "Activos individuales": "#ff7f00",
+        "Portafolio optimo": "#2ca25f",
+    },
+    labels={"Risk": f"Riesgo acumulado horizonte ({horizon_label})",
+            "Return": f"Retorno esperado acumulado ({horizon_label})", "Categoria": ""},
+)
+if len(ef_sorted) > 0:
+    fig.add_trace(go.Scatter(x=ef_sorted["Risk"], y=ef_sorted["Return"], mode="lines",
+                              line=dict(color="#08519c", width=2), opacity=0.6,
+                              name="Frontera eficiente", showlegend=False, hoverinfo="skip"))
+fig.update_traces(marker=dict(size=6, opacity=0.5), selector=dict(name="Frontera eficiente"))
+fig.update_traces(marker=dict(size=9, opacity=0.75), selector=dict(name="Activos individuales"))
+fig.update_traces(marker=dict(size=16, line=dict(width=1.5, color="black")), selector=dict(name="Portafolio optimo"))
+fig.update_layout(
+    title=dict(text="Frontera Eficiente - Minima Varianza<br>"
+                     f"<sup>Horizonte: {horizon_label} (~{horizon_weeks:.1f} sem) | Periodo datos: {start_date} -> "
+                     f"{end_date:%Y-%m-%d} | {len(selected_tickers)} activos</sup>"),
+    xaxis_tickformat=".1%", yaxis_tickformat=".1%",
+    template="plotly_white",
+)
+fig.show()
 
 
 def prepare_weights_with_cash(weights, total_weight, label):
@@ -1909,22 +1927,24 @@ def prepare_weights_with_cash(weights, total_weight, label):
 
 df_weights = prepare_weights_with_cash(metrics_minvar["Weights"], metrics_minvar["Total_Weight"], "Minima Varianza")
 
-fig, ax = plt.subplots(figsize=(6, 8))
-bottom = 0
-colors = plt.cm.tab20(np.linspace(0, 1, len(df_weights)))
-for (idx, row), color in zip(df_weights.iterrows(), colors):
-    ax.bar(row["Portfolio"], row["Weight"], bottom=bottom, color=color, width=0.4, label=row["Symbol"])
-    if abs(row["Weight"]) > 0.03:
-        ax.text(0, bottom + row["Weight"] / 2, f"{row['Weight'] * 100:.1f}%",
-                ha="center", va="center", color="white", fontweight="bold", fontsize=9)
-    bottom += row["Weight"]
-ax.set_title("Asignacion Optima de Activos - Minima Varianza", fontweight="bold", fontsize=13)
-ax.set_ylabel("Peso del Portafolio (%)")
-ax.yaxis.set_major_formatter(plt.matplotlib.ticker.PercentFormatter(xmax=1))
-ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
-plt.suptitle(f"Horizonte: {horizon_label} | Peso max por activo: {max_weight_per_asset * 100:.0f}%", fontsize=9)
-plt.tight_layout()
-plt.show()
+df_weights_plot = df_weights.sort_values("Weight", ascending=True)
+fig = px.bar(
+    df_weights_plot, x="Weight", y="Symbol", orientation="h",
+    text=df_weights_plot["Weight"].map(lambda x: f"{x * 100:.1f}%"),
+    labels={"Weight": "Peso del portafolio", "Symbol": ""},
+    color_discrete_sequence=["#2ca25f"],
+)
+fig.update_traces(textposition="outside", marker_line_width=0,
+                   hovertemplate="%{y}: %{x:.2%}<extra></extra>")
+fig.update_layout(
+    title=dict(text="Asignacion Optima de Activos - Minima Varianza<br>"
+                     f"<sup>Horizonte: {horizon_label} | Peso max por activo: {max_weight_per_asset * 100:.0f}%</sup>"),
+    xaxis_tickformat=".0%",
+    template="plotly_white",
+    showlegend=False,
+    height=max(400, 24 * len(df_weights_plot)),
+)
+fig.show()
 
 corr_matrix = log_returns_selected.corr()
 try:
@@ -1936,19 +1956,18 @@ try:
 except Exception:
     corr_ordered = corr_matrix
 
-fig, ax = plt.subplots(figsize=(9, 8))
-im = ax.imshow(corr_ordered.values, cmap="RdBu", vmin=-1, vmax=1)
-ax.set_xticks(range(len(corr_ordered.columns)))
-ax.set_yticks(range(len(corr_ordered.columns)))
-ax.set_xticklabels(corr_ordered.columns, rotation=90, fontsize=8)
-ax.set_yticklabels(corr_ordered.columns, fontsize=8)
-for i in range(corr_ordered.shape[0]):
-    for j in range(corr_ordered.shape[1]):
-        ax.text(j, i, f"{corr_ordered.values[i, j]:.2f}", ha="center", va="center", fontsize=6)
-plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-ax.set_title(f"Matriz de Correlacion - {len(selected_tickers)} activos seleccionados", fontweight="bold")
-plt.tight_layout()
-plt.show()
+fig = px.imshow(
+    corr_ordered.values, x=corr_ordered.columns, y=corr_ordered.columns,
+    color_continuous_scale="RdBu", zmin=-1, zmax=1, text_auto=".2f", aspect="auto",
+    labels=dict(color="Correlacion"),
+)
+fig.update_xaxes(tickangle=90)
+fig.update_traces(textfont_size=8, hovertemplate="%{x} vs %{y}: %{z:.2f}<extra></extra>")
+fig.update_layout(
+    title=f"Matriz de Correlacion - {len(selected_tickers)} activos seleccionados",
+    template="plotly_white",
+)
+fig.show()
 
 # ==============================================================================
 # SECCION 12: RESUMEN FINAL
