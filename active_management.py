@@ -13,6 +13,7 @@ import pandas as pd
 import requests
 from scipy.stats import norm
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # ============================================================================
 # BLOQUE 1: PARAMETROS CONFIGURABLES
@@ -673,40 +674,59 @@ def generate_executive_dashboard(tabla_rebalanceo):
     return tabla_fmt
 
 
-def plot_gamma_profile(analysis):
-    if analysis is None or analysis.get("status") != "OK" or analysis.get("gex") is None:
+def plot_gamma_profiles(analyses):
+    valid = {tk: an for tk, an in analyses.items()
+             if an is not None and an.get("status") == "OK" and an.get("gex") is not None}
+    if not valid:
         return None
 
-    gex_df = analysis["gex"]["gex_by_strike"]
-    spot = analysis["spot_price"]
-    flip = analysis["gex"]["gex_flip_level"]
-    em = analysis["expected_move"]
+    tickers_ = list(valid.keys())
+    n = len(tickers_)
+    cols = min(3, n)
+    rows = math.ceil(n / cols)
 
-    colors = [gamma_profile_colors["positivo"] if v > 0 else gamma_profile_colors["negativo"]
-              for v in gex_df["net_gex"]]
+    subplot_titles = [
+        f"{tk} | Exp: {valid[tk]['expiration']} | {valid[tk]['gex']['gex_regime']}"
+        for tk in tickers_
+    ]
+    fig = make_subplots(rows=rows, cols=cols, subplot_titles=subplot_titles)
 
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=gex_df["strike"], y=gex_df["net_gex"] / 1e6, marker_color=colors,
-                          showlegend=False, hovertemplate="Strike %{x}: %{y:.2f} $MM<extra></extra>"))
+    for i, tk in enumerate(tickers_):
+        analysis = valid[tk]
+        r, c = i // cols + 1, i % cols + 1
 
-    fig.add_vline(x=spot, line_color="black", annotation_text=f"Spot: {spot:.2f}",
-                  annotation_position="top left")
+        gex_df = analysis["gex"]["gex_by_strike"]
+        spot = analysis["spot_price"]
+        flip = analysis["gex"]["gex_flip_level"]
+        em = analysis["expected_move"]
 
-    if pd.notna(flip):
-        fig.add_vline(x=flip, line_color=gamma_profile_colors["flip"], line_dash="dash",
-                      annotation_text=f"Flip: {flip:.2f}", annotation_position="bottom left",
-                      annotation_font_color=gamma_profile_colors["flip"])
+        colors = [gamma_profile_colors["positivo"] if v > 0 else gamma_profile_colors["negativo"]
+                  for v in gex_df["net_gex"]]
 
-    if em is not None:
-        fig.add_vrect(x0=em["lower_bound"], x1=em["upper_bound"], fillcolor="orange",
-                      opacity=0.08, line_width=0)
+        fig.add_trace(go.Bar(x=gex_df["strike"], y=gex_df["net_gex"] / 1e6, marker_color=colors,
+                              showlegend=False, hovertemplate="Strike %{x}: %{y:.2f} $MM<extra></extra>"),
+                      row=r, col=c)
+
+        fig.add_vline(x=spot, line_color="black", annotation_text=f"Spot: {spot:.2f}",
+                      annotation_position="top left", row=r, col=c)
+
+        if pd.notna(flip):
+            fig.add_vline(x=flip, line_color=gamma_profile_colors["flip"], line_dash="dash",
+                          annotation_text=f"Flip: {flip:.2f}", annotation_position="bottom left",
+                          annotation_font_color=gamma_profile_colors["flip"], row=r, col=c)
+
+        if em is not None:
+            fig.add_vrect(x0=em["lower_bound"], x1=em["upper_bound"], fillcolor="orange",
+                          opacity=0.08, line_width=0, row=r, col=c)
+
+        fig.update_xaxes(title_text="Strike", row=r, col=c)
+        fig.update_yaxes(title_text="Net GEX ($MM)", row=r, col=c)
 
     fig.update_layout(
-        title=dict(text=f"{analysis['ticker']} — Perfil de Exposicion Gamma (GEX)<br>"
-                         f"<sup>Expiracion: {analysis['expiration']} | "
-                         f"Regimen: {analysis['gex']['gex_regime']}</sup>"),
-        xaxis_title="Strike", yaxis_title="Net GEX ($MM por 1% de movimiento)",
+        title="Perfil de Exposicion Gamma (GEX) por Activo",
         template="plotly_white",
+        height=380 * rows,
+        showlegend=False,
     )
     return fig
 
@@ -747,12 +767,7 @@ def run_active_management_engine(portfolio, horizon_days, api_key, cash_limit):
 
     dashboard = generate_executive_dashboard(tabla_rebalanceo)
 
-    gamma_plots = {}
-    for tk, an in analyses.items():
-        fig = plot_gamma_profile(an)
-        if fig is not None:
-            gamma_plots[tk] = fig
-
+    gamma_plot = plot_gamma_profiles(analyses)
     allocation_plot = plot_allocation_comparison(tabla_rebalanceo)
 
     return {
@@ -760,7 +775,7 @@ def run_active_management_engine(portfolio, horizon_days, api_key, cash_limit):
         "scores": scores_df,
         "tabla_rebalanceo": tabla_rebalanceo,
         "dashboard": dashboard,
-        "gamma_plots": gamma_plots,
+        "gamma_plot": gamma_plot,
         "allocation_plot": allocation_plot,
     }
 
@@ -770,8 +785,8 @@ def run_active_management_engine(portfolio, horizon_days, api_key, cash_limit):
 
 resultado = run_active_management_engine(portfolio, investment_horizon_days, polygon_api_key, cash_reserve_limit)
 
-for tk, fig in resultado["gamma_plots"].items():
-    fig.show()
+if resultado["gamma_plot"] is not None:
+    resultado["gamma_plot"].show()
 
 resultado["allocation_plot"].show()
 
