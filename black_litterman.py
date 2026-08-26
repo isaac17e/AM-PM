@@ -48,15 +48,15 @@ SEMANAS_MES = 4.33
 # -----------------------------------------------------------------------------
 # 3. PERFIL DE RIESGO
 # -----------------------------------------------------------------------------
-PERFIL_RIESGO = "moderado"
+PERFIL_RIESGO = "agresivo"
 
 # -----------------------------------------------------------------------------
 # 4. PARAMETROS DE OPTIMIZACION (por perfil)
 # -----------------------------------------------------------------------------
 PERFILES = {
-    "conservador": dict(delta=4.0, omega_scale=5.0, tau=0.025),
-    "moderado": dict(delta=2.5, omega_scale=1.0, tau=0.05),
-    "agresivo": dict(delta=1.0, omega_scale=0.25, tau=0.10),
+    "conservador": dict(omega_scale=5.0, tau=0.025, gamma_ra=6.0),
+    "moderado": dict(omega_scale=1.0, tau=0.05, gamma_ra=3.0),
+    "agresivo": dict(omega_scale=0.25, tau=0.10, gamma_ra=1.5),
 }
 
 # -----------------------------------------------------------------------------
@@ -580,12 +580,12 @@ print("\nPesos de mercado (w_mkt):")
 print(pd.Series(np.round(w_mkt, 4), index=tickers))
 
 # =============================================================================
-# BLOQUE 3: PERFIL DE RIESGO -> DELTA, TAU, OMEGA_SCALE
+# BLOQUE 3: PERFIL DE RIESGO -> TAU, OMEGA_SCALE, GAMMA_RA
 # =============================================================================
 
 perfil = PERFILES[PERFIL_RIESGO]
-delta = perfil["delta"]
 tau = perfil["tau"]
+gamma_ra = perfil["gamma_ra"]
 
 desc_perfiles = dict(
     conservador="Portafolio cercano al benchmark. Views con poco peso.",
@@ -593,16 +593,27 @@ desc_perfiles = dict(
     agresivo="Portafolio con fuerte inclinacion hacia los views del gestor.",
 )
 
+# --- Delta de mercado (fijo, no depende del perfil) -------------------------
+# delta_mkt es la aversion al riesgo IMPLICITA del mercado (CAPM invertido):
+# cuanto retorno en exceso exige el mercado por unidad de varianza. Se calcula
+# con datos historicos, no con el perfil del gestor, para que pi_eq (y por lo
+# tanto el Sharpe de referencia) no cambie solo por elegir otro perfil.
+Rf_h = Rf * (MESES_HORIZONTE / 12)
+ret_mkt_hist = float(w_mkt @ mu_historico)
+var_mkt_hist = float(w_mkt @ Sigma_hist @ w_mkt)
+delta_mkt = (ret_mkt_hist - Rf_h) / var_mkt_hist
+
 print(f"\n=== PERFIL: {PERFIL_RIESGO.upper()} ===")
 print(f"Descripcion: {desc_perfiles[PERFIL_RIESGO]}")
-print(f"Delta (d): {delta} | Tau (t): {tau} | Omega scale: {perfil['omega_scale']}")
+print(f"Delta de mercado (fijo): {delta_mkt:.4f} | Tau (t): {tau} | "
+      f"Omega scale: {perfil['omega_scale']} | Gamma_RA: {gamma_ra}")
 
 # =============================================================================
 # BLOQUE 4: RETORNOS DE EQUILIBRIO pi - CAPM INVERTIDO
 # =============================================================================
 
 Sigma_mat = Sigma.values
-pi_eq = delta * (Sigma_mat @ w_mkt)
+pi_eq = delta_mkt * (Sigma_mat @ w_mkt)
 
 print("\n=== Retornos de equilibrio pi (prior) ===")
 print(pd.Series(np.round(pi_eq, 4), index=tickers))
@@ -610,8 +621,6 @@ print(pd.Series(np.round(pi_eq, 4), index=tickers))
 # =============================================================================
 # BLOQUE 5: TABLA DE REFERENCIA PARA VIEWS
 # =============================================================================
-
-Rf_h = Rf * (MESES_HORIZONTE / 12)
 
 referencia_views = pd.DataFrame({
     "Ticker": tickers,
@@ -635,26 +644,25 @@ N_VIEWS = 3
 P = pd.DataFrame(0.0, index=[f"View_{i+1}" for i in range(N_VIEWS)], columns=tickers)
 
 # VIEW 1 - RELATIVO: NVDA outperforma a XOM
-P.loc["View_1", "META"] = 1
-P.loc["View_1", "GOOGL"] = -1
+P.loc["View_1", "DELL"] = 1
+P.loc["View_1", "META"] = -1
 
 # VIEW 2 - RELATIVO: JPM y MA outperforman a JNJ y MRK
-P.loc["View_2", "ORCL"] = 0.5
-P.loc["View_2", "CRM"] = 0.5
-P.loc["View_2", "BLK"] = -0.5
-P.loc["View_2", "MSFT"] = -0.5
+P.loc["View_2", "GS"] = 1
+P.loc["View_2", "REGN"] = -1
 
 # VIEW 3 - ABSOLUTO: MSFT retorna al menos X% en el horizonte
-P.loc["View_3", "DELL"] = 1
+P.loc["View_3", "EBAY"] = 1
+P.loc["View_3", "ARES"] = -1
 
 print("\n=== Matriz P (views del gestor) ===")
 print(P.round(4))
 
 # --- PASO 3: Define el vector Q ---------------------------------------------
 Q = pd.Series({
-    "View_1": 0.08,
-    "View_2": 0.06,
-    "View_3": 0.3,
+    "View_1": 0.15,
+    "View_2": 0.10,
+    "View_3": 0.08,
 })
 
 print("\n=== Vector Q (magnitudes del gestor) ===")
@@ -740,7 +748,6 @@ print(f"\nSigma_BL calculada. Norma Frobenius |Sigma_BL - Sigma|: "
 
 from scipy.optimize import minimize as scipy_minimize
 
-GAMMA_RA = 3.0
 LAMBDA3 = 1.0
 LAMBDA4 = 1.0
 
@@ -806,7 +813,7 @@ constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
 
 resultado_mvsk = scipy_minimize(
     utilidad_mvsk_negativa, w0,
-    args=(mu_opt, Sigma_opt, M3, M4, GAMMA_RA, LAMBDA3, LAMBDA4),
+    args=(mu_opt, Sigma_opt, M3, M4, gamma_ra, LAMBDA3, LAMBDA4),
     method="SLSQP", bounds=bounds, constraints=constraints,
     options=dict(maxiter=500, ftol=1e-10),
 )
@@ -843,7 +850,6 @@ var_port = float(w_mvsk_vec @ Sigma_opt @ w_mvsk_vec)
 vol_port = math.sqrt(var_port)
 skew_port = portfolio_skew(w_mvsk_vec, M3)
 kurt_port = portfolio_kurt(w_mvsk_vec, M4)
-Rf_h = Rf * (MESES_HORIZONTE / 12)
 sharpe_BL = (ret_port - Rf_h) / vol_port
 
 ret_mkt = float(w_mkt @ mu_BL_vec)
@@ -899,7 +905,7 @@ for nm, pf in PERFILES.items():
     try:
         aj_sim = (pf["tau"] * Sigma_mat) @ P_mat.T @ np.linalg.inv(M_sim) @ (Q_adj_col - P_mat @ pi_eq_col)
         mu_sim = pi_eq_col + aj_sim
-        Dm_sim = pf["delta"] * Sigma_mat * 2 + np.eye(n) * 1e-10
+        Dm_sim = pf["gamma_ra"] * Sigma_mat * 2 + np.eye(n) * 1e-10
         dv_sim = mu_sim.flatten()
         Amat_sim = np.column_stack([np.ones(n), np.eye(n)])
         bvec_sim = np.concatenate([[1.0], np.zeros(n)])
