@@ -32,16 +32,16 @@ POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
 # 1. UNIVERSO DE TICKERS
 # -----------------------------------------------------------------------------
 TICKERS = [
-    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN",
-    "META", "BRK.B", "LLY", "JPM", "V",
-    "XOM", "UNH", "MA", "JNJ", "PG",
-    "HD", "MRK", "AVGO", "CVX", "COST",
+    "META", "GOOGL", "ORCL", "DELL", "MSFT",
+    "BLK", "CRM", "CMCSA", "GS", "REGN",
+    "ABNB", "ARES", "LVS", "BXP", "CYBR",
+    "YELP", "EBAY", "IT", "EL"
 ]
 
 # -----------------------------------------------------------------------------
 # 2. HORIZONTE TEMPORAL
 # -----------------------------------------------------------------------------
-MESES_HORIZONTE = 1
+MESES_HORIZONTE = 4
 DIAS_HABILES_MES = 21
 SEMANAS_MES = 4.33
 
@@ -68,7 +68,7 @@ MAX_TICKERS_FINAL = 10
 # -----------------------------------------------------------------------------
 # 6. TASA LIBRE DE RIESGO - FALLBACK
 # -----------------------------------------------------------------------------
-Rf = 0.044
+Rf = 0.046
 
 # -----------------------------------------------------------------------------
 # 7. ANALISIS DE MAXIMUM DRAWDOWN (MDD)
@@ -458,6 +458,9 @@ def otm_price_ssvi(K, S, F, T, r, rho, eta, gamma, theta_tau):
     return bs_price(S, K, T, r, sigma_k, tipo=tipo)
 
 
+_trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+
+
 def calcular_bkm_moments(S, F, T, r, rho, eta, gamma, theta_tau,
                           n_std=6, n_puntos=400):
     sigma_atm = sigma_desde_ssvi(F, F, T, rho, eta, gamma, theta_tau)
@@ -477,9 +480,9 @@ def calcular_bkm_moments(S, F, T, r, rho, eta, gamma, theta_tau,
     peso_X = (12.0 * lnKF ** 2 - 4.0 * lnKF ** 3) / strikes ** 2
 
     factor = np.exp(r * T)
-    V_T = factor * np.trapz(peso_V * precios, strikes)
-    W_T = factor * np.trapz(peso_W * precios, strikes)
-    X_T = factor * np.trapz(peso_X * precios, strikes)
+    V_T = factor * _trapz(peso_V * precios, strikes)
+    W_T = factor * _trapz(peso_W * precios, strikes)
+    X_T = factor * _trapz(peso_X * precios, strikes)
 
     mu_T = (np.exp(r * T) - 1
             - np.exp(r * T) / 2 * V_T
@@ -632,26 +635,26 @@ N_VIEWS = 3
 P = pd.DataFrame(0.0, index=[f"View_{i+1}" for i in range(N_VIEWS)], columns=tickers)
 
 # VIEW 1 - RELATIVO: NVDA outperforma a XOM
-P.loc["View_1", "NVDA"] = 1
-P.loc["View_1", "XOM"] = -1
+P.loc["View_1", "META"] = 1
+P.loc["View_1", "GOOGL"] = -1
 
 # VIEW 2 - RELATIVO: JPM y MA outperforman a JNJ y MRK
-P.loc["View_2", "JPM"] = 0.5
-P.loc["View_2", "MA"] = 0.5
-P.loc["View_2", "JNJ"] = -0.5
-P.loc["View_2", "MRK"] = -0.5
+P.loc["View_2", "ORCL"] = 0.5
+P.loc["View_2", "CRM"] = 0.5
+P.loc["View_2", "BLK"] = -0.5
+P.loc["View_2", "MSFT"] = -0.5
 
 # VIEW 3 - ABSOLUTO: MSFT retorna al menos X% en el horizonte
-P.loc["View_3", "MSFT"] = 1
+P.loc["View_3", "DELL"] = 1
 
 print("\n=== Matriz P (views del gestor) ===")
 print(P.round(4))
 
 # --- PASO 3: Define el vector Q ---------------------------------------------
 Q = pd.Series({
-    "View_1": 0.10,
+    "View_1": 0.08,
     "View_2": 0.06,
-    "View_3": 0.08,
+    "View_3": 0.3,
 })
 
 print("\n=== Vector Q (magnitudes del gestor) ===")
