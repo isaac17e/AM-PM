@@ -36,7 +36,6 @@ investment_horizon_days = 30
 from dotenv import load_dotenv
 load_dotenv()
 polygon_api_key = os.environ.get("POLYGON_API_KEY")
-
 cash_reserve_limit      = 0.30
 
 risk_free_rate           = 0.046
