@@ -69,8 +69,8 @@ weight_sharpe = 0.55
 weight_low_vol = 0.15
 weight_decorr = 0.30
 
-n_pre_filter = 45
-n_filter_candidates = 30
+n_pre_filter = 65
+n_filter_candidates = 40
 
 qubo_exact_threshold = 2e6
 qubo_sa_iterations = 20000
