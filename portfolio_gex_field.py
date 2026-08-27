@@ -4,7 +4,12 @@
 
 import os
 import time
+import json
+import functools
+import threading
 import webbrowser
+from string import Template
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
@@ -14,6 +19,7 @@ from scipy.ndimage import gaussian_filter1d
 from datetime import datetime, timedelta
 import requests
 import plotly.graph_objects as go
+import plotly.io as pio
 import yfinance as yf
 import warnings
 
@@ -48,30 +54,40 @@ SIGMA_RANGE = 3.0
 SIGMA_RESOLUTION = 60
 GEX_SMOOTHING_SIGMA = 2.0
 ALPHA_GEX = 1.0
-BETA_MACRO_AMPLIFICATION = 0.8
+# Amplificación asimétrica: la tensión macro dispara las zonas de riesgo (gamma negativa)
+# más de lo que profundiza las zonas estables (gamma positiva), dando relieve real en (X,Y)
+# en vez de una simple reescala uniforme de la misma curva 1D.
+BETA_MACRO_RISK_AMPLIFICATION = 0.8
+BETA_MACRO_STABLE_DAMPENING = 0.25
 GAMMA_MACRO_TILT = 0.6
 
 GRADIENT_EPSILON = 1e-4
 ARROW_SCALE = 0.35
 SPHERE_SIZE = 12
 
+# Diverging: azul (estable) <-> gris neutro (0) <-> rojo (riesgo). cmid=0 en el trace
+# de superficie centra el colorscale en el punto de equilibrio real, no en el punto medio
+# del rango de datos.
+DIVERGING_COLORSCALE = [[0.0, "#3987e5"], [0.5, "#383835"], [1.0, "#e66767"]]
+
+HISTORY_MAX_POINTS = 30
+
 PORTFOLIO_HOLDINGS = {
-    "9432.T": 0.1647,
-    "DUK": 0.1381,
-    "GLD": 0.1251,
-    "VZ": 0.1020,
-    "RSG": 0.0921,
-    "MCD": 0.0865,
-    "WM": 0.0796,
-    "PDBC": 0.0749,
-    "CME": 0.0707,
-    "T": 0.0662
+    "GOOGL": 0.3088,
+    "MSFT": 0.2099,
+    "DELL": 0.1244,
+    "META": 0.115,
+    "ORCL": 0.1148,
+    "EBAY": 0.1142,
+    "CRM": 0.0129
 }
 
 REFRESH_SECONDS = 60
 MAX_ITERATIONS = None
 ROTATE_CAMERA = True
 OUTPUT_HTML_PATH = "portfolio_gex_field.html"
+DATA_JSON_FILENAME = "portfolio_gex_field_data.json"
+LOCAL_SERVER_PORT = 8765
 OPEN_BROWSER_ON_START = True
 
 MIN_SIGMA_COVERAGE = 2.0
@@ -702,7 +718,8 @@ def generate_portfolio_potential_surface(grid_sigma, composite_force, macro_y_ax
     X, Y = np.meshgrid(grid_sigma, grid_y)
 
     P_x_grid = np.tile(-composite_force, (resolution, 1))
-    Z = ALPHA_GEX * P_x_grid * (1 + BETA_MACRO_AMPLIFICATION * Y) + GAMMA_MACRO_TILT * Y
+    amplification = np.where(P_x_grid > 0, BETA_MACRO_RISK_AMPLIFICATION, BETA_MACRO_STABLE_DAMPENING)
+    Z = ALPHA_GEX * P_x_grid * (1 + amplification * Y) + GAMMA_MACRO_TILT * Y
 
     print(f"✅ Superficie de potencial del portafolio generada: grid {resolution}x{resolution} | "
           f"±{sigma_range}σ | Y actual (macro): {y_current:.3f}")
@@ -710,7 +727,7 @@ def generate_portfolio_potential_surface(grid_sigma, composite_force, macro_y_ax
 
     surface_data = {
         "grid_sigma": grid_sigma, "grid_y": grid_y, "composite_force": composite_force,
-        "y_current": y_current, "sigma_range": sigma_range,
+        "force_grid": P_x_grid, "y_current": y_current, "sigma_range": sigma_range,
     }
 
     return X, Y, Z, surface_data
@@ -719,7 +736,8 @@ def generate_portfolio_potential_surface(grid_sigma, composite_force, macro_y_ax
 def potential_function(x, y, grid_sigma, composite_force):
     force_at_x = np.interp(x, grid_sigma, composite_force)
     P_x = -force_at_x
-    return ALPHA_GEX * P_x * (1 + BETA_MACRO_AMPLIFICATION * y) + GAMMA_MACRO_TILT * y
+    amplification = np.where(P_x > 0, BETA_MACRO_RISK_AMPLIFICATION, BETA_MACRO_STABLE_DAMPENING)
+    return ALPHA_GEX * P_x * (1 + amplification * y) + GAMMA_MACRO_TILT * y
 
 
 def calculate_gradient(x0, y0, grid_sigma, composite_force, h=GRADIENT_EPSILON):
@@ -804,6 +822,7 @@ def get_holdings_reference_lines(portfolio_data, sigma_range=SIGMA_RANGE):
 # ============================================================
 
 def plot_3d_portfolio_field(X, Y, Z, current_state, reference_lines, portfolio_data,
+                             surface_data=None, state_history=None,
                              horizon_months=TIME_HORIZON_MONTHS, camera_eye=None):
     if X is None or Y is None or Z is None:
         print("❌ Superficie no disponible. No se puede graficar.")
@@ -811,12 +830,37 @@ def plot_3d_portfolio_field(X, Y, Z, current_state, reference_lines, portfolio_d
 
     fig = go.Figure()
 
-    fig.add_trace(go.Surface(
-        x=X, y=Y, z=Z, colorscale="RdYlBu_r", opacity=0.85,
+    surface_kwargs = dict(
+        x=X, y=Y, z=Z, colorscale=DIVERGING_COLORSCALE, cmid=0, opacity=0.85,
         colorbar=dict(title="Potencial Z<br>(riesgo)", x=1.02),
         contours={"z": {"show": True, "usecolormap": True, "project_z": False}},
         name="Campo de Potencial del Portafolio",
-    ))
+    )
+    if surface_data is not None and surface_data.get("force_grid") is not None:
+        surface_kwargs["customdata"] = surface_data["force_grid"]
+        surface_kwargs["hovertemplate"] = (
+            "X: %{x:.2f}σ<br>Tensión macro (Y): %{y:.0%}<br>"
+            "Potencial (Z): %{z:.3f}<br>Fuerza GEX compuesta: %{customdata:.3f}<extra></extra>"
+        )
+    fig.add_trace(go.Surface(**surface_kwargs))
+
+    if state_history:
+        hist_y = [h["y"] for h in state_history]
+        hist_z = [h["z"] for h in state_history]
+        n_hist = len(hist_y)
+        denom = max(n_hist - 1, 1)
+        # scatter3d.marker.opacity no admite arreglos (a diferencia de scatter2d); el
+        # desvanecido por antigüedad se logra con el canal alfa de rgba(...) por punto.
+        marker_colors = [f"rgba(134,182,239,{0.15 + 0.75 * (i / denom):.3f})" for i in range(n_hist)]
+        sizes = [4 + 4 * (i / denom) for i in range(n_hist)]
+        fig.add_trace(go.Scatter3d(
+            x=[0.0] * n_hist, y=hist_y, z=hist_z,
+            mode="lines+markers",
+            line=dict(color="rgba(134,182,239,0.35)", width=2),
+            marker=dict(size=sizes, color=marker_colors),
+            name="Trayectoria del portafolio",
+            hovertemplate="Y=%{y:.2f} | Z=%{z:.3f}<extra></extra>",
+        ))
 
     if current_state is not None:
         tickers_label = ", ".join(portfolio_data.keys()) if portfolio_data else "Portafolio"
@@ -839,14 +883,36 @@ def plot_3d_portfolio_field(X, Y, Z, current_state, reference_lines, portfolio_d
                 name="Gradiente -∇Z del portafolio",
             ))
 
+    grid_sigma = surface_data["grid_sigma"] if surface_data else None
+    composite_force = surface_data["composite_force"] if surface_data else None
+    grid_y_full = surface_data["grid_y"] if surface_data else np.array([0.0, 1.0])
+
     line_colors = {"Gamma Flip": "orange", "Call Wall": "blue", "Put Wall": "red"}
+    max_weight = max((ref.get("weight") or 0.0 for ref in reference_lines), default=0.0) or 1.0
+    seen_labels = set()
     for ref in reference_lines:
         color = line_colors.get(ref["label"], "gray")
+        weight = ref.get("weight") or 0.0
+        weight_frac = weight / max_weight
+        line_width = 1.5 + 4.0 * weight_frac
+        line_opacity = 0.35 + 0.55 * weight_frac
+        show_in_legend = ref["label"] not in seen_labels
+        seen_labels.add(ref["label"])
+
+        if grid_sigma is not None and composite_force is not None:
+            y_line = grid_y_full
+            z_line = potential_function(ref["sigma_x"], y_line, grid_sigma, composite_force)
+        else:
+            y_line, z_line = [0, 1], [Z.min(), Z.min()]
+
         try:
             fig.add_trace(go.Scatter3d(
-                x=[ref["sigma_x"], ref["sigma_x"]], y=[0, 1], z=[Z.min(), Z.min()],
-                mode="lines", line=dict(color=color, width=3, dash="dash"),
-                name=f"{ref['ticker']} {ref['label']} ({ref['strike']:.1f})",
+                x=[ref["sigma_x"]] * len(y_line), y=y_line, z=z_line,
+                mode="lines", line=dict(color=color, width=line_width, dash="dash"),
+                opacity=line_opacity, legendgroup=ref["label"], showlegend=show_in_legend,
+                name=ref["label"],
+                hovertemplate=(f"{ref['ticker']} — {ref['label']}<br>Strike: {ref['strike']:.1f}"
+                                f"<br>Peso: {weight:.1%}<extra></extra>"),
             ))
         except Exception as e:
             print(f"⚠️  No se pudo dibujar la línea de referencia de {ref['ticker']} '{ref['label']}': {e}")
@@ -882,38 +948,128 @@ def plot_3d_portfolio_field(X, Y, Z, current_state, reference_lines, portfolio_d
 
 
 # ============================================================
-# BLOQUE 9B: SALIDA HTML AUTORREFRESCANTE
+# BLOQUE 9B: SALIDA HTML CON ACTUALIZACIÓN INCREMENTAL
 # ============================================================
+# En vez de recargar la página completa cada refresh (flicker + pérdida de la
+# cámara del usuario), se escribe un HTML "shell" una sola vez y, en cada
+# iteración, solo se actualiza un JSON con los datos de la figura. El propio
+# JS del shell hace fetch + Plotly.react preservando la cámara, y anima la
+# rotación de cámara de forma continua y suave en el cliente.
 
-def write_portfolio_html(fig, output_path=OUTPUT_HTML_PATH, refresh_seconds=REFRESH_SECONDS):
-    if fig is None:
-        return
-
-    plot_div = fig.to_html(include_plotlyjs="cdn", full_html=False,
-                            config={"responsive": True, "displaylogo": False})
-    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-
-    html = f"""<!DOCTYPE html>
+_HTML_SHELL_TEMPLATE = Template("""<!DOCTYPE html>
 <html lang="es">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="refresh" content="{refresh_seconds}">
 <title>Portfolio GEX Potential Field</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 <style>
-  html, body {{ margin: 0; padding: 0; background: #0b0d10; color: #d8dee5;
-                font-family: -apple-system, "Segoe UI", sans-serif; }}
-  .footer {{ padding: 8px 16px; font-size: 12px; opacity: 0.65; }}
+  html, body { margin: 0; padding: 0; background: #0b0d10; color: #d8dee5;
+                font-family: -apple-system, "Segoe UI", sans-serif; height: 100%; }
+  #gexPlot { width: 100vw; height: calc(100vh - 32px); }
+  .footer { padding: 8px 16px; font-size: 12px; opacity: 0.65; height: 16px; }
 </style>
 </head>
 <body>
-{plot_div}
-<div class="footer">Última actualización: {timestamp} — refresco automático cada {refresh_seconds}s</div>
-</body>
-</html>"""
+<div id="gexPlot"></div>
+<div class="footer">Última actualización: <span id="lastUpdate">—</span> — refresco de datos cada ${refresh_seconds}s${rotation_note}</div>
+<script>
+(function() {
+  const DATA_URL = ${data_url_js};
+  const REFRESH_MS = ${refresh_ms};
+  const ROTATE = ${rotate_js};
+  const gd = document.getElementById('gexPlot');
+  let angle = 0.0;
+  let userInteracted = false;
+  let selfTriggeredRelayout = false;
 
-    with open(output_path, "w", encoding="utf-8") as f:
+  function rotatedCamera(a) {
+    return { eye: { x: 1.6 * Math.cos(a), y: -1.6 + 0.4 * Math.sin(a * 0.6), z: 1.2 } };
+  }
+
+  function applyCamera(camera) {
+    selfTriggeredRelayout = true;
+    Plotly.relayout(gd, {'scene.camera': camera}).then(function() { selfTriggeredRelayout = false; });
+  }
+
+  function loadPlot(initial) {
+    fetch(DATA_URL + '?t=' + Date.now(), {cache: 'no-store'})
+      .then(function(resp) { return resp.json(); })
+      .then(function(fig) {
+        if (initial) {
+          return Plotly.newPlot(gd, fig.data, fig.layout, {responsive: true, displaylogo: false})
+            .then(function() {
+              gd.on('plotly_relayout', function(ev) {
+                const touchedCamera = Object.keys(ev).some(function(k) { return k.indexOf('scene.camera') === 0; });
+                if (touchedCamera && !selfTriggeredRelayout) { userInteracted = true; }
+              });
+            });
+        } else {
+          const keepCamera = gd.layout && gd.layout.scene ? gd.layout.scene.camera : undefined;
+          if (keepCamera) { fig.layout.scene.camera = keepCamera; }
+          return Plotly.react(gd, fig.data, fig.layout, {responsive: true, displaylogo: false});
+        }
+      })
+      .then(function() {
+        document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+      })
+      .catch(function(err) { console.error('Error actualizando el campo GEX:', err); });
+  }
+
+  loadPlot(true);
+  setInterval(function() { loadPlot(false); }, REFRESH_MS);
+
+  if (ROTATE) {
+    setInterval(function() {
+      if (userInteracted) return;
+      angle += 0.02;
+      applyCamera(rotatedCamera(angle));
+    }, 60);
+  }
+})();
+</script>
+</body>
+</html>""")
+
+
+def write_portfolio_data_json(fig, output_dir, filename=DATA_JSON_FILENAME):
+    if fig is None:
+        return None
+    path = os.path.join(output_dir, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(pio.to_json(fig, remove_uids=True))
+    return path
+
+
+def write_portfolio_html_shell(output_dir, output_filename, data_json_filename,
+                                refresh_seconds=REFRESH_SECONDS, rotate_camera=ROTATE_CAMERA):
+    path = os.path.join(output_dir, output_filename)
+    rotation_note = " · rotación automática de cámara activa" if rotate_camera else ""
+    html = _HTML_SHELL_TEMPLATE.substitute(
+        refresh_seconds=refresh_seconds,
+        rotation_note=rotation_note,
+        data_url_js=json.dumps(data_json_filename),
+        refresh_ms=int(refresh_seconds * 1000),
+        rotate_js="true" if rotate_camera else "false",
+    )
+    with open(path, "w", encoding="utf-8") as f:
         f.write(html)
-    print(f"💾 HTML actualizado: {os.path.abspath(output_path)}")
+    print(f"💾 HTML base escrito: {os.path.abspath(path)}")
+    return path
+
+
+def start_local_file_server(directory, preferred_port=LOCAL_SERVER_PORT, attempts=10):
+    handler_cls = functools.partial(SimpleHTTPRequestHandler, directory=directory)
+    for offset in range(attempts):
+        port = preferred_port + offset
+        try:
+            httpd = ThreadingHTTPServer(("127.0.0.1", port), handler_cls)
+        except OSError:
+            continue
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        print(f"🌐 Servidor local iniciado en http://127.0.0.1:{port} (sirviendo {directory})")
+        return port
+    raise RuntimeError("No se pudo iniciar el servidor local: todos los puertos candidatos están ocupados.")
 
 
 # ============================================================
@@ -938,14 +1094,20 @@ def run_once():
     return {
         "X": X, "Y": Y, "Z": Z, "current_state": current_state,
         "reference_lines": reference_lines, "portfolio_data": portfolio_data,
+        "surface_data": surface_data,
     }
 
 
 def run_live(refresh_seconds=REFRESH_SECONDS, max_iterations=MAX_ITERATIONS,
              rotate_camera=ROTATE_CAMERA, output_path=OUTPUT_HTML_PATH,
              open_browser=OPEN_BROWSER_ON_START):
-    angle = 0.0
     iteration = 0
+    state_history = []
+
+    output_dir = os.path.dirname(os.path.abspath(output_path)) or "."
+    output_filename = os.path.basename(output_path)
+    server_port = start_local_file_server(output_dir, LOCAL_SERVER_PORT)
+    page_url = f"http://127.0.0.1:{server_port}/{output_filename}"
 
     while max_iterations is None or iteration < max_iterations:
         print(f"\n{'='*60}\n🔄 Iteración {iteration + 1} | refrescando cada {refresh_seconds}s | "
@@ -954,22 +1116,26 @@ def run_live(refresh_seconds=REFRESH_SECONDS, max_iterations=MAX_ITERATIONS,
         result = run_once()
 
         if result is not None:
-            camera_eye = None
-            if rotate_camera:
-                angle += 0.35
-                camera_eye = dict(
-                    x=1.6 * np.cos(angle), y=-1.6 + 0.4 * np.sin(angle * 0.6), z=1.2
-                )
+            current_state = result["current_state"]
+            if current_state is not None:
+                state_history.append({"y": current_state["y"], "z": current_state["z"]})
+                if len(state_history) > HISTORY_MAX_POINTS:
+                    state_history = state_history[-HISTORY_MAX_POINTS:]
 
             fig = plot_3d_portfolio_field(
                 result["X"], result["Y"], result["Z"],
                 result["current_state"], result["reference_lines"],
-                result["portfolio_data"], camera_eye=camera_eye,
+                result["portfolio_data"], surface_data=result["surface_data"],
+                state_history=state_history,
             )
             if fig is not None:
-                write_portfolio_html(fig, output_path, refresh_seconds)
-                if open_browser and iteration == 0:
-                    webbrowser.open(f"file://{os.path.abspath(output_path)}")
+                write_portfolio_data_json(fig, output_dir, DATA_JSON_FILENAME)
+                print(f"💾 Datos actualizados: {os.path.join(output_dir, DATA_JSON_FILENAME)}")
+                if iteration == 0:
+                    write_portfolio_html_shell(output_dir, output_filename, DATA_JSON_FILENAME,
+                                                refresh_seconds, rotate_camera)
+                    if open_browser:
+                        webbrowser.open(page_url)
         else:
             print("⚠️  No se generó gráfico en esta iteración; se reintentará en el próximo refresh.")
 
