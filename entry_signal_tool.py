@@ -32,6 +32,9 @@ PESOS = {
 UMBRAL_ALTO = 75
 UMBRAL_MEDIO = 40
 
+HORIZON_DIAS_OBJETIVO = 30
+VENTANA_BUSQUEDA_VENCIMIENTO_DIAS = 20
+
 SEGUNDOS_ENTRE_LLAMADAS_STOCKS = 13  # respeta el limite de 5/min del tier gratuito Stocks Basic
 
 HIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "entry_signal_history.csv")
@@ -68,11 +71,35 @@ def get_spot_y_volumen_relativo(ticker):
     volumen_relativo = volumen_hoy / adv_20
     return spot, volumen_relativo
 
-def get_options_chain(ticker, spot):
+def seleccionar_vencimiento_objetivo(ticker, horizon_days):
+    hoy = datetime.now(timezone.utc).date()
+    fecha_objetivo = hoy + timedelta(days=horizon_days)
+    url = f"{BASE_URL}/v3/reference/options/contracts"
+    params = {
+        "underlying_ticker": ticker,
+        "expiration_date.gte": str(hoy),
+        "expiration_date.lte": str(fecha_objetivo + timedelta(days=VENTANA_BUSQUEDA_VENCIMIENTO_DIAS)),
+        "limit": 1000,
+        "order": "asc",
+        "sort": "expiration_date",
+        "apiKey": API_KEY,
+    }
+    r = requests.get(url, params=params).json()
+    resultados = r.get("results", [])
+    if not resultados:
+        return None
+    vencimientos = sorted({c["expiration_date"] for c in resultados if c.get("expiration_date")})
+    if not vencimientos:
+        return None
+    vencimientos = [datetime.strptime(v, "%Y-%m-%d").date() for v in vencimientos]
+    return min(vencimientos, key=lambda d: abs((d - fecha_objetivo).days))
+
+def get_options_chain(ticker, spot, vencimiento):
     url = f"{BASE_URL}/v3/snapshot/options/{ticker}"
     params = {
         "strike_price.gte": round(spot * 0.85, 2),
         "strike_price.lte": round(spot * 1.15, 2),
+        "expiration_date": vencimiento.strftime("%Y-%m-%d"),
         "limit": 250,
         "apiKey": API_KEY
     }
@@ -118,12 +145,29 @@ def calcular_gex_y_zero_gamma(df_chain, spot):
     df["gex_strike"] = signo * df["gamma"] * df["oi"] * 100 * spot**2 * 0.01
     gex_por_strike = df.groupby("strike")["gex_strike"].sum().sort_index()
     gex_total = gex_por_strike.sum()
-    acumulado = gex_por_strike.cumsum()
-    cruce = acumulado[(acumulado.shift(1) < 0) & (acumulado >= 0)]
-    if not cruce.empty:
-        zero_gamma = cruce.index[0]
-    else:
-        zero_gamma = gex_por_strike.idxmin() if gex_total < 0 else gex_por_strike.idxmax()
+
+    # Se excluyen strikes sin exposicion real (gex_strike == 0, tipicamente sin
+    # OI) de la busqueda del cruce, y se detecta el cruce en cualquier
+    # direccion (no solo negativo->positivo) para no perder flips genuinos.
+    gex_sig = gex_por_strike[gex_por_strike != 0]
+    acumulado_sig = gex_sig.cumsum()
+    zero_gamma = np.nan
+    if len(acumulado_sig) >= 2:
+        signs = np.sign(acumulado_sig.values)
+        change_idx = np.where(np.diff(signs) != 0)[0]
+        if len(change_idx) > 0:
+            i = change_idx[0]
+            x0, y0 = acumulado_sig.index[i], acumulado_sig.values[i]
+            x1, y1 = acumulado_sig.index[i + 1], acumulado_sig.values[i + 1]
+            zero_gamma = x0 - y0 * (x1 - x0) / (y1 - y0)
+
+    if pd.isna(zero_gamma):
+        # Sin cruce de signo real dentro de la ventana: no hay nivel de
+        # zero-gamma confiable que reportar (antes esto devolvia por error
+        # la strike de mayor concentracion de gamma, un "wall", como si
+        # fuera el flip).
+        return gex_total, np.nan
+
     distancia_zero_gamma = (spot - zero_gamma) / spot
     return gex_total, distancia_zero_gamma
 
@@ -222,7 +266,11 @@ def percentile_historico(hist_df, ticker, columna, valor_actual):
 
 def calcular_indicadores_ticker(ticker, hist_df):
     spot, vol_relativo = get_spot_y_volumen_relativo(ticker)
-    chain = parse_chain(get_options_chain(ticker, spot))
+    vencimiento = seleccionar_vencimiento_objetivo(ticker, HORIZON_DIAS_OBJETIVO)
+    if vencimiento is None:
+        chain = pd.DataFrame()
+    else:
+        chain = parse_chain(get_options_chain(ticker, spot, vencimiento))
 
     gex_total, dist_zero_gamma = calcular_gex_y_zero_gamma(chain, spot)
     call_wall, put_wall = calcular_walls(chain)
@@ -235,6 +283,7 @@ def calcular_indicadores_ticker(ticker, hist_df):
 
     crudos = {
         "spot": spot,
+        "vencimiento": vencimiento,
         "gex_total": gex_total,
         "dist_zero_gamma": dist_zero_gamma,
         "call_wall": call_wall,

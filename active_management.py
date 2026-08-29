@@ -67,7 +67,18 @@ score_flow_sweep             = 25
 score_flow_balanced          = 5
 score_pcr_scale              = 15
 score_pcr_cap                = 15
+score_vanna_weight              = 10
+score_vanna_intensity_divisor   = 1e6
+score_vanna_intensity_base      = 0.4
+score_vanna_intensity_scale     = 0.6
+score_charm_weight              = 10
+score_charm_intensity_divisor   = 1e6
+score_charm_intensity_base      = 0.4
+score_charm_intensity_scale     = 0.6
 score_override_cap           = -51
+
+gex_liquidity_min_notional   = 1_000_000
+score_low_liquidity_damping  = 0.5
 
 recorte_score_range = (-50, -1)
 recorte_pct_range   = (0.50, 0.25)
@@ -252,21 +263,32 @@ def calculate_gex(chain, spot_price):
     gex_by_strike["cum_gex"] = gex_by_strike["net_gex"].cumsum()
 
     flip_level = np.nan
-    signs = np.sign(gex_by_strike["cum_gex"].values)
-    change_idx = np.where(np.diff(signs) != 0)[0]
-    if len(change_idx) > 0:
-        i = change_idx[0]
-        x0, y0 = gex_by_strike["strike"].iloc[i], gex_by_strike["cum_gex"].iloc[i]
-        x1, y1 = gex_by_strike["strike"].iloc[i + 1], gex_by_strike["cum_gex"].iloc[i + 1]
-        flip_level = x0 - y0 * (x1 - x0) / (y1 - y0)
+    # Se excluyen strikes sin exposicion real (net_gex == 0, tipicamente OI=0)
+    # de la busqueda del cruce de signo. Sin este filtro, el cumsum se queda
+    # en signo 0 durante los strikes sin OI y np.sign() detecta un "cambio"
+    # espurio justo donde empiezan los primeros datos reales de la ventana
+    # (comun en tickers de poca liquidez de opciones), en vez de un nivel
+    # de flip genuino. Los valores de cum_gex usados si son los reales.
+    gex_sig = gex_by_strike[gex_by_strike["net_gex"] != 0].reset_index(drop=True)
+    if len(gex_sig) >= 2:
+        signs = np.sign(gex_sig["cum_gex"].values)
+        change_idx = np.where(np.diff(signs) != 0)[0]
+        if len(change_idx) > 0:
+            i = change_idx[0]
+            x0, y0 = gex_sig["strike"].iloc[i], gex_sig["cum_gex"].iloc[i]
+            x1, y1 = gex_sig["strike"].iloc[i + 1], gex_sig["cum_gex"].iloc[i + 1]
+            flip_level = x0 - y0 * (x1 - x0) / (y1 - y0)
 
     total_gex = gex_by_strike["net_gex"].sum()
+    total_abs_gex = gex_by_strike["net_gex"].abs().sum()
 
     return {
         "gex_by_strike": gex_by_strike,
         "total_gex": total_gex,
+        "total_abs_gex": total_abs_gex,
         "gex_flip_level": flip_level,
         "gex_regime": "POSITIVO" if total_gex >= 0 else "NEGATIVO",
+        "liquidity_confidence": "BAJA" if total_abs_gex < gex_liquidity_min_notional else "NORMAL",
     }
 
 
@@ -496,6 +518,7 @@ def calculate_tactical_score(analysis):
     gex = analysis["gex"]
     flow = analysis["flow"]
     em = analysis["expected_move"]
+    vc = analysis["vanna_charm"]
 
     score = 0.0
     reasons = []
@@ -530,6 +553,28 @@ def calculate_tactical_score(analysis):
         score += pcr_points
         reasons.append(f"PCR volumen = {flow['pcr_volume']:.2f}")
 
+    if vc is not None and pd.notna(vc["net_vanna_exposure"]):
+        vanna_points = score_vanna_weight if vc["net_vanna_exposure"] >= 0 else -score_vanna_weight
+        intensity = min(abs(vc["net_vanna_exposure"]) / (spot * score_vanna_intensity_divisor), 1)
+        vanna_points = vanna_points * (score_vanna_intensity_base + score_vanna_intensity_scale * intensity)
+        score += vanna_points
+        reasons.append(f"Vanna: {vc['vanna_regime']} ({vc['net_vanna_exposure']/1e6:.2f}MM)")
+
+    if vc is not None and pd.notna(vc["net_charm_exposure"]):
+        charm_points = score_charm_weight if vc["net_charm_exposure"] >= 0 else -score_charm_weight
+        intensity = min(abs(vc["net_charm_exposure"]) / (spot * score_charm_intensity_divisor), 1)
+        charm_points = charm_points * (score_charm_intensity_base + score_charm_intensity_scale * intensity)
+        score += charm_points
+        reasons.append(f"Charm: {vc['charm_regime']} ({vc['net_charm_exposure']/1e6:.2f}MM)")
+
+    liquidity_confidence = gex["liquidity_confidence"] if gex is not None else "NORMAL"
+    if liquidity_confidence == "BAJA":
+        score = score * score_low_liquidity_damping
+        reasons.append(
+            f"Confianza BAJA: notional GEX ${gex['total_abs_gex']:,.0f} < umbral "
+            f"${gex_liquidity_min_notional:,.0f} (poca liquidez de opciones) - score amortiguado x{score_low_liquidity_damping}"
+        )
+
     score = max(min(score, 100), -100)
 
     max_pain_break = gex is not None and pd.notna(gex["gex_flip_level"]) and spot < gex["gex_flip_level"]
@@ -562,6 +607,7 @@ def calculate_tactical_score(analysis):
         "recorte_pct": recorte_sugerido,
         "gex_flip_level": gex["gex_flip_level"] if gex is not None else np.nan,
         "total_gex": gex["total_gex"] if gex is not None else np.nan,
+        "liquidity_confidence": liquidity_confidence,
         "sweep_bias": flow["sweep_bias"] if flow is not None else None,
         "expected_move_lower": em["lower_bound"] if em is not None else np.nan,
         "expected_move_upper": em["upper_bound"] if em is not None else np.nan,

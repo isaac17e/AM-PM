@@ -564,15 +564,25 @@ def compute_zero_gamma_level(gex_profile):
     if len(gex_profile) < 2:
         return np.nan
     gp = gex_profile.sort_values("strike").reset_index(drop=True)
-    cum_gex = gp["GEX_neto"].cumsum().values
-    signs = np.sign(cum_gex)
+    gp["cum_gex"] = gp["GEX_neto"].cumsum()
+
+    # Se excluyen strikes sin exposicion real (GEX_neto == 0, tipicamente sin
+    # OI en ese vencimiento) de la busqueda del cruce de signo. Sin este filtro,
+    # el cumsum se queda en signo 0 durante esos strikes y np.sign() detecta un
+    # "cambio" espurio en el borde de la ventana de datos en vez de un nivel
+    # de zero-gamma genuino. Los valores de cum_gex usados si son los reales.
+    gp_sig = gp[gp["GEX_neto"] != 0].reset_index(drop=True)
+    if len(gp_sig) < 2:
+        return np.nan
+
+    signs = np.sign(gp_sig["cum_gex"].values)
     diffs = np.diff(signs)
     sign_change_idx = np.where(diffs != 0)[0]
     if len(sign_change_idx) == 0:
         return np.nan
     i = sign_change_idx[0]
-    x1, x2 = gp["strike"].iloc[i], gp["strike"].iloc[i + 1]
-    y1, y2 = cum_gex[i], cum_gex[i + 1]
+    x1, x2 = gp_sig["strike"].iloc[i], gp_sig["strike"].iloc[i + 1]
+    y1, y2 = gp_sig["cum_gex"].iloc[i], gp_sig["cum_gex"].iloc[i + 1]
     return x1 + (0 - y1) * (x2 - x1) / (y2 - y1)
 
 def compute_max_pain(chain):
