@@ -5,6 +5,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import re
+import io
 import time
 import math
 from datetime import date, datetime, timedelta
@@ -44,7 +45,7 @@ benchmark = "SPY"
 
 n_top_sp500 = 80
 n_top_nasdaq = 80
-n_top_international = 15
+n_top_international = 5
 target_total_tickers = 200
 
 start_date = "2018-01-01"
@@ -72,17 +73,17 @@ tail_risk_beta = 0.05               # beta: aversion a asimetria implicita negat
 risk_free_rate = 0.047
 risk_free_rate_weekly = risk_free_rate / 52
 
-n_pre_seasonal = 90  # ampliado de 45: con 45 el filtro por volatilidad dejaba solo ~4-17 acciones
+n_pre_seasonal = 70  # ampliado de 45: con 45 el filtro por volatilidad dejaba solo ~4-17 acciones
                       # individuales (vs. ~30-40 ETFs) porque los ETFs diversificados tienen menor
                       # vol standalone, lo que dejaba estructuralmente infactible el tope etf_max_weight.
-                      # Con 90 el pool queda ~50/50 acciones/ETFs.
+                      # Con 70 el pool queda ~50/50 acciones/ETFs.
 n_divers_candidates = 35
 
-volatility_percentile = 0.97
-correlation_percentile = 0.9
-max_assets_in_portfolio = 6
+volatility_percentile = 0.55
+correlation_percentile = 0.60
+max_assets_in_portfolio = 15
 
-max_weight_per_asset = 0.35
+max_weight_per_asset = 0.12
 min_weight_per_asset = 0.001
 
 require_full_investment = False
@@ -90,8 +91,8 @@ min_total_weight = 1.00
 max_total_weight = 1.00
 
 use_etf_constraint = True
-etf_min_weight = 0.00
-etf_max_weight = 0.05
+etf_min_weight = 0.30
+etf_max_weight = 0.55
 
 use_fx_factor = True
 max_fx_exposure = 0.35
@@ -106,9 +107,9 @@ dte_tol_iv = 7
 moneyness_tol_iv = 0.02
 
 use_iv_shrinkage = True
-shrinkage_max = 0.40
-shrinkage_min = 0.02
-ratio_band = 0.20
+shrinkage_max = 0.85
+shrinkage_min = 0.35
+ratio_band = 0.30
 
 use_sector_factor = True
 use_country_factor = True
@@ -158,7 +159,7 @@ def safe_scrape_table(url, fallback=None):
         if resp.status_code != 200:
             print(f"[ADVERTENCIA] HTTP {resp.status_code} al obtener {url}")
             return fallback
-        tables = pd.read_html(resp.text)
+        tables = pd.read_html(io.StringIO(resp.text))
         if not tables:
             return fallback
         return tables[0]

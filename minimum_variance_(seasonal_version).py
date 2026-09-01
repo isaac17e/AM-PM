@@ -6,6 +6,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import re
+import io
 import time
 import math
 from datetime import date, datetime, timedelta
@@ -45,7 +46,7 @@ benchmark = "SPY"
 
 n_top_sp500 = 50
 n_top_nasdaq = 50
-n_top_international = 30
+n_top_international = 5
 target_total_tickers = 130
 
 # HORIZONTE DE DATOS HISTORICOS
@@ -59,14 +60,14 @@ execution_months = [9]
 risk_free_rate = 0.045
 risk_free_rate_weekly = risk_free_rate / 52
 
-n_pre_seasonal = 45
+n_pre_seasonal = 70
 n_divers_candidates = 45
 
-volatility_percentile = 0.97
-correlation_percentile = 0.90
-max_assets_in_portfolio = 6
+volatility_percentile = 0.55
+correlation_percentile = 0.60
+max_assets_in_portfolio = 15
 
-seasonal_min_weeks = 10
+seasonal_min_weeks = 20
 
 # === PARAMETROS BKM Y TAIL RISK (VaR_CF Cornish-Fisher, fusionado con la ventana estacional) ===
 bkm_moneyness_lo = 0.70            # limite inferior de moneyness K/S para strikes OTM
@@ -82,7 +83,7 @@ tail_risk_alpha = 0.05              # alpha: aversion a curtosis implicita (MFIK
 tail_risk_beta = 0.05               # beta: aversion a asimetria implicita negativa (MFIS) en diag(Sigma)
 
 # RESTRICCIONES DE PONDERACION
-max_weight_per_asset = 0.35
+max_weight_per_asset = 0.12
 min_weight_per_asset = 0.001
 
 # ESTRATEGIA DE PONDERACION
@@ -92,8 +93,8 @@ max_total_weight = 1.00
 
 # === RESTRICCION DE PARTICIPACION DE ETFs EN EL PORTAFOLIO FINAL ===
 use_etf_constraint = True
-etf_min_weight = 0.00
-etf_max_weight = 0.05
+etf_min_weight = 0.30
+etf_max_weight = 0.55
 
 # === RESTRICCION DE EXPOSICION CAMBIARIA (tickers no denominados en USD) ===
 use_fx_factor = True
@@ -103,7 +104,7 @@ annualization_factor = 52
 
 # === FILTRO DELTA (Black-Scholes) ===
 use_delta_filter = True
-delta_min = 0.30
+delta_min = 0.55
 delta_strike_mode = "atm"
 target_dte_iv = 30
 dte_tol_iv = 7
@@ -111,9 +112,9 @@ moneyness_tol_iv = 0.02
 
 # === SHRINKAGE COVARIANZA: IMPLIED vs HISTORICA ===
 use_iv_shrinkage = True
-shrinkage_max = 0.40
-shrinkage_min = 0.02
-ratio_band = 0.20
+shrinkage_max = 0.85
+shrinkage_min = 0.35
+ratio_band = 0.30
 
 # === CORRELACION IMPLICITA DE FACTORES (MERCADO + SECTOR + PAIS + FX) ===
 use_sector_factor = True
@@ -185,7 +186,7 @@ def safe_scrape_table(url, fallback=None):
         if resp.status_code != 200:
             print(f"[ADVERTENCIA] HTTP {resp.status_code} al obtener {url}")
             return fallback
-        tables = pd.read_html(resp.text)
+        tables = pd.read_html(io.StringIO(resp.text))
         if not tables:
             return fallback
         return tables[0]
