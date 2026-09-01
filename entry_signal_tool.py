@@ -18,9 +18,6 @@ API_KEY = os.environ.get("POLYGON_API_KEY")
 
 BASE_URL = "https://api.polygon.io"
 
-TICKERS = ["XLU", "GLD", "T", "GILD", "FXI", "MRK", "ADP", "KO",
-           "ABT", "VRTX", "AMGN", "UNP", "NEE", "ABBV", "TMO"]
-
 # Peso objetivo de cada activo dentro del portafolio total (debe coincidir con
 # `portfolio` en portfolio_risk_score_leverage.py). Se usa para traducir el %
 # ya invertido / % pendiente de cada activo a puntos porcentuales del portafolio.
@@ -29,6 +26,8 @@ PESOS_OBJETIVO = {
     "MRK": 0.0734, "ADP": 0.0595, "KO": 0.0578, "ABT": 0.0562, "VRTX": 0.0541,
     "AMGN": 0.0509, "UNP": 0.0485, "NEE": 0.0484, "ABBV": 0.0235, "TMO": 0.0142,
 }
+
+TICKERS = list(PESOS_OBJETIVO.keys())
 
 PESOS = {
     "gex_regime": 0.18,
