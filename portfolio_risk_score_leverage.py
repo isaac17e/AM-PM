@@ -6,14 +6,21 @@ import pandas as pd
 from datetime import date
 
 portfolio = {
-    "GLD": 0.18,
-    "DHR": 0.18,
-    "CASY": 0.18,
-    "IBKR": 0.1443,
-    "CDNS": 0.1014,
-    "SLV": 0.096,
-    "PDBC": 0.0722,
-    "CME": 0.0385
+    "XLU": 0.12,
+    "GLD": 0.12,
+    "T": 0.1031,
+    "GILD": 0.0925,
+    "FXI": 0.0779,
+    "MRK": 0.0734,
+    "ADP": 0.0595,
+    "KO": 0.0578,
+    "ABT": 0.0562,
+    "VRTX": 0.0541,
+    "AMGN": 0.0509,
+    "UNP": 0.0485,
+    "NEE": 0.0484,
+    "ABBV": 0.0235,
+    "TMO": 0.0142
 }
 
 total_weight = sum(portfolio.values())
