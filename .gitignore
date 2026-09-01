@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .venv/
 .DS_Store
+entry_signal_history.csv
+entry_state.json
