@@ -44,9 +44,9 @@ if not POLYGON_API_KEY:
 
 benchmark = "SPY"
 
-n_top_sp500 = 50
-n_top_nasdaq = 50
-n_top_international = 5
+n_top_sp500 = 80
+n_top_nasdaq = 80
+n_top_international = 20
 target_total_tickers = 130
 
 # HORIZONTE DE DATOS HISTORICOS
@@ -104,7 +104,7 @@ annualization_factor = 52
 
 # === FILTRO DELTA (Black-Scholes) ===
 use_delta_filter = True
-delta_min = 0.55
+delta_min = 0.3
 delta_strike_mode = "atm"
 target_dte_iv = 30
 dte_tol_iv = 7
