@@ -90,6 +90,9 @@ score_threshold_recortar = -50
 
 # --- capa de riesgo de portafolio ---
 corr_method             = "sample"       # "ewma" | "rmt" | "sample"
+# corr_method ya no fija la matriz final: fija la ESTRUCTURA historica sobre la
+# que se monta el nivel implicito, y es tambien la matriz de respaldo cuando la
+# ecuacion de dispersion no se puede resolver.
 # Con N=8 activos y T~275 dias, la muestra cruda esta bien condicionada (T >> N):
 # recupera relaciones conocidas (GLD-SLV ~0.8) que el shrinkage de EWMA/RMT, calibrado
 # a la memoria corta del EWMA (T efectivo ~17 obs con lambda=0.94), aplana o inventa.
@@ -99,6 +102,47 @@ corr_ewma_lambda        = 0.94
 corr_eig_floor          = 1e-8
 corr_min_observations   = 20
 atm_iv_n_strikes        = 6
+
+# --- correlacion implicita despejada de opciones (dispersion) ---
+corr_source               = "implicita"   # "implicita" | "historica"
+implied_corr_benchmark    = "SPY"         # ETF de referencia por defecto (bloque GLOBAL)
+implied_corr_weights      = "portafolio"  # "portafolio" | "equiponderado"
+
+# Benchmarks por bloque / subclase de activo. Una canasta heterogenea no tiene un
+# solo indice que la represente: la IV de SPY no dice nada sobre la correlacion
+# GLD-SLV. Cada bloque despeja SU rho contra SU ETF de referencia, y los tickers
+# que no aparezcan en ningun bloque caen al bloque GLOBAL con
+# implied_corr_benchmark. Con el dict vacio todos caen ahi y el comportamiento es
+# el de un unico benchmark para toda la canasta.
+BLOQUE_CORR_GLOBAL = "GLOBAL"
+implied_corr_blocks = {
+    "COMMODITIES": {"benchmark": "DBC", "tickers": ("GLD", "SLV", "PDBC")},
+}
+
+# Pares ENTRE bloques distintos. Ningun mercado de opciones cotiza la correlacion
+# oro-equity, y el ETF que representaria a la canasta heterogenea completa es
+# justo el que no existe: por eso, por defecto, esos pares conservan su
+# correlacion historica, que si es estimable y trae el signo correcto de las
+# coberturas cruzadas. "escalada" les aplica el mismo factor de nivel que se les
+# aplico a los bloques (promedio ponderado por masa de pares), asumiendo que si
+# la implicita corre por encima de la historica dentro de cada clase tambien lo
+# hace entre clases. Es una heuristica de regimen, no un precio de mercado.
+implied_corr_cross_block  = "historica"   # "historica" | "escalada"
+implied_corr_structure    = "escalada"    # "escalada" (conserva la forma historica) | "plana"
+# Rango admisible del rho despejado. El piso teorico de una correlacion uniforme
+# es -1/(N-1), pero un rho negativo o cercano a cero entre un ETF de referencia y
+# una canasta real casi siempre indica un desajuste de datos, no diversificacion
+# perfecta: se acota y se avisa en vez de propagar una matriz irreal.
+implied_corr_bounds       = (0.05, 0.99)
+implied_corr_min_iv_share = 0.60          # fraccion minima del peso con IV real de opciones
+implied_corr_max_offdiag  = 0.99
+implied_corr_scale_max    = 10.0
+implied_corr_scale_iter   = 80
+# La proyeccion a definida positiva del ensamblaje corre un poco el nivel de cada
+# bloque; estas dos controlan el lazo que lo devuelve a su objetivo.
+implied_corr_block_tol    = 1e-4
+implied_corr_block_repair = 8
+
 history_request_pause_sec = 1.0
 history_max_retries       = 4
 
@@ -657,10 +701,12 @@ def calculate_tactical_score(analysis):
 # ============================================================================
 # BLOQUE 5: CAPA DE RIESGO DE PORTAFOLIO (CORRELACION Y ATRIBUCION DE EULER)
 # Convierte los analisis por ticker en una vista de portafolio: volatilidad
-# implicita por activo desde la cadena, matriz de correlacion historica
-# (EWMA / RMT), covarianza y atribucion de riesgo por descomposicion de Euler.
-# La correlacion entra por una sola matriz para poder sustituirla mas adelante
-# por una correlacion implicita despejada de opciones sobre indice.
+# implicita por activo desde la cadena, matriz de correlacion IMPLICITA
+# despejada de la ecuacion de dispersion (IV ATM de los componentes contra la
+# IV ATM del ETF de referencia), covarianza y atribucion de riesgo por
+# descomposicion de Euler. Toda la capa es forward-looking: las vol vienen de
+# la cadena y el nivel de correlacion tambien. El historico (EWMA / RMT /
+# muestral) queda como estructura de apoyo y como respaldo si falta la IV.
 # ============================================================================
 
 def get_price_history(tickers, lookback_days=corr_lookback_days, api_key=polygon_api_key):
@@ -801,6 +847,390 @@ def historical_sigma_annual(prices, ticker, trading_days_per_year=252):
     return float(rets.std(ddof=1) * math.sqrt(trading_days_per_year))
 
 
+def _pair_weights(weights, sigmas):
+    # Peso de cada par (i, j) dentro de la varianza del portafolio: w_i w_j s_i s_j.
+    # Es la misma ponderacion con la que la correlacion entra en sigma_p^2, asi que
+    # el promedio de la matriz ponderado por estos pesos es exactamente el rho que
+    # la ecuacion de dispersion despeja.
+    ws = np.asarray(weights, dtype=float) * np.asarray(sigmas, dtype=float)
+    pair_w = np.outer(ws, ws)
+    np.fill_diagonal(pair_w, 0.0)
+    return pair_w
+
+
+def _weighted_mean_corr(corr, pair_w, mask=None):
+    # Nivel medio de correlacion. Con `mask` se mide sobre una REGION de la matriz
+    # (los pares dentro de un bloque, o los pares entre bloques) en vez de sobre
+    # todos los pares. pair_w ya trae la diagonal en cero.
+    p = pair_w if mask is None else pair_w * mask
+    den = float(p.sum())
+    if abs(den) < 1e-14:
+        return np.nan
+    return float((p * corr).sum() / den)
+
+
+def solve_implied_correlation(weights, sigmas, sigma_benchmark, idx=None):
+    # Ecuacion de dispersion. La varianza del indice es la suma de las varianzas
+    # de sus componentes mas los terminos cruzados; con un unico rho para todos
+    # los pares queda una sola incognita:
+    #     sigma_B^2 = sum_i w_i^2 sigma_i^2 + rho * sum_{i != j} w_i w_j sigma_i sigma_j
+    #     rho = (sigma_B^2 - sum_i w_i^2 sigma_i^2) / sum_{i != j} w_i w_j sigma_i sigma_j
+    # Con sigmas implicitas de la cadena a ambos lados, el rho resultante es la
+    # correlacion que el mercado de opciones esta cotizando hacia adelante, no la
+    # que se realizo en el pasado.
+    #
+    # `idx` restringe la ecuacion a un BLOQUE de la cartera: una subclase de
+    # activo con su propio ETF de referencia (commodities contra DBC, equities
+    # contra SPY). Los pesos se renormalizan DENTRO del bloque porque
+    # sigma_benchmark es la vol del bloque visto como cartera completa, no su
+    # contribucion al portafolio total; sin renormalizar, un bloque que pesa 35%
+    # del portafolio arrojaria un rho inflado por un factor de ~1/0.35^2.
+    w = np.asarray(weights, dtype=float)
+    s = np.asarray(sigmas, dtype=float)
+    if idx is not None:
+        idx = np.asarray(idx, dtype=int)
+        w, s = w[idx], s[idx]
+
+    if not np.isfinite(sigma_benchmark) or sigma_benchmark <= 0:
+        return np.nan
+    if w.size < 2 or not np.all(np.isfinite(w)) or not np.all(np.isfinite(s)):
+        return np.nan
+
+    total = float(np.sum(w))
+    if total <= 1e-12:
+        return np.nan
+    w = w / total
+
+    ws = w * s
+    var_propia = float(np.sum(ws ** 2))                    # sum_i w_i^2 sigma_i^2
+    den = float(np.sum(ws)) ** 2 - var_propia              # sum_{i != j} w_i w_j sigma_i sigma_j
+    if den <= 1e-14:
+        return np.nan
+    return (float(sigma_benchmark) ** 2 - var_propia) / den
+
+
+def resolve_corr_blocks(tickers, blocks=implied_corr_blocks,
+                        benchmark_global=implied_corr_benchmark):
+    # Reparte los tickers en bloques y devuelve (orden, indices por bloque,
+    # benchmark por bloque). Lo que no este mapeado cae al bloque GLOBAL: con
+    # implied_corr_blocks vacio todos caen ahi y queda un unico benchmark para
+    # toda la canasta, que es el comportamiento por defecto.
+    tickers = list(tickers)
+    asignacion, benchmarks = {}, {}
+
+    for nombre, cfg in (blocks or {}).items():
+        bmk = (cfg or {}).get("benchmark")
+        if not bmk:
+            warnings.warn(f"El bloque de correlacion '{nombre}' no declara benchmark: se ignora.")
+            continue
+        benchmarks[nombre] = bmk
+        for tk in (cfg.get("tickers") or ()):
+            if tk not in tickers:
+                continue
+            if tk in asignacion:
+                warnings.warn(f"{tk} aparece en los bloques '{asignacion[tk]}' y '{nombre}': "
+                              f"se queda en '{asignacion[tk]}'.")
+                continue
+            asignacion[tk] = nombre
+
+    sueltos = [tk for tk in tickers if tk not in asignacion]
+    if sueltos:
+        benchmarks[BLOQUE_CORR_GLOBAL] = benchmark_global
+        for tk in sueltos:
+            asignacion[tk] = BLOQUE_CORR_GLOBAL
+
+    orden, idx_por_bloque = [], {}
+    for nombre in list(blocks or {}) + [BLOQUE_CORR_GLOBAL]:
+        if nombre not in benchmarks:
+            continue
+        idx = [i for i, tk in enumerate(tickers) if asignacion.get(tk) == nombre]
+        if not idx:
+            continue                       # bloque configurado sin ningun ticker en cartera
+        orden.append(nombre)
+        idx_por_bloque[nombre] = np.asarray(idx, dtype=int)
+    return orden, idx_por_bloque, benchmarks
+
+
+def _solve_region_scale(corr_hist, pair_w, mask, rho_objetivo,
+                        max_offdiag=implied_corr_max_offdiag,
+                        k_max=implied_corr_scale_max,
+                        n_iter=implied_corr_scale_iter):
+    # Una sola ecuacion no puede despejar los N(N-1)/2 pares de una region: lo que
+    # el mercado de opciones observa es su NIVEL agregado. Asi que se conserva la
+    # FORMA historica de la region (que par esta mas correlacionado con cual, y el
+    # signo de las coberturas) y se busca el factor que lleva su nivel al rho
+    # implicito. El recorte a max_offdiag rompe la linealidad del escalado, por eso
+    # el factor se busca por biseccion en vez de despejarse.
+    def nivel(k):
+        return _weighted_mean_corr(np.clip(k * corr_hist, -max_offdiag, max_offdiag),
+                                   pair_w, mask)
+
+    base = nivel(1.0)
+    if not np.isfinite(base) or base <= 1e-6:
+        return None                        # sin nivel historico positivo el escalado no es monotono
+    if rho_objetivo < 0 or nivel(k_max) < rho_objetivo:
+        return None                        # el nivel implicito no es alcanzable escalando
+
+    lo, hi = 0.0, float(k_max)
+    for _ in range(n_iter):
+        mid = 0.5 * (lo + hi)
+        if nivel(mid) < rho_objetivo:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def _assemble_regions(corr_hist, regiones, escalas, planas, mask_cruce=None, k_cruce=None,
+                      max_offdiag=implied_corr_max_offdiag):
+    # Ensambla la matriz por regiones: cada bloque lleva su propio nivel implicito
+    # y los pares entre bloques se tratan segun implied_corr_cross_block. Las
+    # mascaras son simetricas por construccion, pero la matriz alimenta una
+    # descomposicion espectral aguas abajo y la simetria se impone explicitamente
+    # en vez de darse por heredada.
+    corr = np.array(corr_hist, dtype=float, copy=True)
+
+    if mask_cruce is not None and k_cruce is not None:
+        corr[mask_cruce] = np.clip(k_cruce * corr_hist[mask_cruce], -max_offdiag, max_offdiag)
+
+    for nombre, mask in regiones.items():
+        if nombre in planas:
+            corr[mask] = planas[nombre]
+        elif nombre in escalas:
+            corr[mask] = np.clip(escalas[nombre] * corr_hist[mask], -max_offdiag, max_offdiag)
+
+    corr = 0.5 * (corr + corr.T)
+    np.fill_diagonal(corr, 1.0)
+    return corr
+
+
+def benchmark_implied_sigma(analyses, horizon_days, api_key=polygon_api_key,
+                            benchmark=implied_corr_benchmark):
+    # La IV ATM del ETF de referencia se saca por el mismo camino que la de los
+    # componentes (misma expiracion objetivo, misma ventana de strikes, mismo
+    # ponderado por open interest) para que ambos lados de la ecuacion de
+    # dispersion sean comparables. Si el benchmark ya esta en el portafolio se
+    # reutiliza su analisis en vez de pedir la cadena dos veces.
+    analisis = analyses.get(benchmark)
+    if analisis is None or analisis.get("status") != "OK":
+        analisis = analyze_ticker_options(benchmark, horizon_days, api_key)
+    return implied_sigma_annual(analisis), analisis
+
+
+def benchmark_implied_sigmas(analyses, benchmarks, horizon_days, api_key=polygon_api_key):
+    # IV ATM de cada benchmark de bloque. Se cachea por ticker: dos bloques que
+    # compartan ETF de referencia cuestan una sola cadena de opciones, que con el
+    # espaciado de Polygon no es un detalle menor.
+    cache = {}
+    for bmk in benchmarks.values():
+        if bmk not in cache:
+            cache[bmk] = benchmark_implied_sigma(analyses, horizon_days, api_key, benchmark=bmk)[0]
+    return {nombre: cache[bmk] for nombre, bmk in benchmarks.items()}
+
+
+def build_implied_correlation(prices, tickers, sigmas, fuentes_vol, weights, sigmas_benchmark,
+                              structure=implied_corr_structure, bounds=implied_corr_bounds,
+                              cross=implied_corr_cross_block):
+    # Devuelve (matriz, detalle). Cada bloque despeja su propio rho contra su
+    # propio benchmark y aporta una region de la matriz; el detalle deja por
+    # escrito de donde salio cada region para que el reporte y el historial puedan
+    # distinguir una corrida implicita de una que cayo al respaldo historico.
+    # `sigmas_benchmark` es un dict {bloque: IV}; un escalar se interpreta como la
+    # IV del unico benchmark de la canasta.
+    tickers = list(tickers)
+    n = len(tickers)
+    w = np.asarray(weights, dtype=float)
+    s = np.asarray(sigmas, dtype=float)
+    fuentes_vol = np.asarray(fuentes_vol)
+
+    corr_hist = estimate_correlation(prices[tickers])
+    pair_w = _pair_weights(w, s)
+    orden, idx_por_bloque, benchmarks = resolve_corr_blocks(tickers)
+    if not isinstance(sigmas_benchmark, dict):
+        sigmas_benchmark = {nombre: sigmas_benchmark for nombre in orden}
+
+    detalle = {
+        "fuente": None,
+        "modo": "bloques" if len(orden) > 1 else "global",
+        "cross_block": cross if len(orden) > 1 else None,
+        "rho_despejado": np.nan,
+        "rho_usado": np.nan,
+        # rho_efectivo se mide sobre los MISMOS pares que rho_usado (los de dentro
+        # de los bloques resueltos), para que uno sea la verificacion del otro.
+        # rho_matriz promedia todos los pares, cruce entre bloques incluido, y por
+        # eso no tiene por que coincidir cuando hay mas de un bloque.
+        "rho_efectivo": np.nan,
+        "rho_matriz": np.nan,
+        "rho_historico": _weighted_mean_corr(corr_hist, pair_w),
+        "rho_cruce_historico": np.nan,
+        "rho_cruce_efectivo": np.nan,
+        "estructura": None,
+        "cobertura_iv": np.nan,
+        "motivo_fallback": None,
+        "bloques": [],
+    }
+
+    peso_total = float(np.sum(np.abs(w)))
+    detalle["cobertura_iv"] = (float(np.sum(np.abs(w[fuentes_vol == "IMPLICITA_ATM"]))) / peso_total
+                               if peso_total > 1e-12 else 0.0)
+
+    def fallback(motivo):
+        detalle["fuente"] = "HISTORICA_FALLBACK"
+        detalle["motivo_fallback"] = motivo
+        detalle["rho_efectivo"] = detalle["rho_historico"]
+        detalle["rho_matriz"] = detalle["rho_historico"]
+        warnings.warn(f"Correlacion implicita no disponible ({motivo}): "
+                      f"se usa la matriz historica ({corr_method}).")
+        return corr_hist, detalle
+
+    if n < 2:
+        return fallback("menos de 2 activos en la capa de riesgo")
+
+    # --- rho implicito de cada bloque contra su propio benchmark -------------
+    regiones, objetivos = {}, {}
+    for nombre in orden:
+        idx = idx_por_bloque[nombre]
+        bmk = benchmarks[nombre]
+        sig_b = sigmas_benchmark.get(nombre, np.nan)
+        sig_b = float(sig_b) if sig_b is not None and np.isfinite(sig_b) else np.nan
+
+        # Un sigma que ya venia del historico no aporta informacion forward-looking:
+        # la cobertura se mide DENTRO del bloque, para que un bloque bien cubierto
+        # no quede castigado por otro que no lo esta.
+        peso_b = float(np.sum(np.abs(w[idx])))
+        cobertura = (float(np.sum(np.abs(w[idx][fuentes_vol[idx] == "IMPLICITA_ATM"]))) / peso_b
+                     if peso_b > 1e-12 else 0.0)
+
+        info = {"bloque": nombre, "benchmark": bmk, "tickers": [tickers[i] for i in idx],
+                "peso": peso_b, "sigma_benchmark": sig_b, "cobertura_iv": cobertura,
+                "rho_despejado": np.nan, "rho_usado": np.nan, "rho_efectivo": np.nan,
+                "estructura": "historica", "motivo": None}
+        detalle["bloques"].append(info)
+
+        if len(idx) < 2:
+            info["motivo"] = "bloque de un solo activo: no tiene pares que despejar"
+        elif not np.isfinite(sig_b) or sig_b <= 0:
+            info["motivo"] = f"sin IV ATM utilizable para {bmk}"
+        elif cobertura < implied_corr_min_iv_share:
+            info["motivo"] = (f"solo {100*cobertura:.0f}% del peso del bloque tiene IV de opciones, "
+                              f"minimo {100*implied_corr_min_iv_share:.0f}%")
+        else:
+            rho = solve_implied_correlation(w, s, sig_b, idx=idx)
+            info["rho_despejado"] = rho
+            if not np.isfinite(rho):
+                info["motivo"] = "la ecuacion de dispersion no tiene solucion en este bloque"
+            else:
+                rho_usado = float(np.clip(rho, bounds[0], bounds[1]))
+                if abs(rho_usado - rho) > 1e-9:
+                    warnings.warn(
+                        f"Bloque '{nombre}': el rho implicito despejado ({rho:.3f}) cae fuera del "
+                        f"rango admisible {bounds} y se acota a {rho_usado:.3f}. Suele indicar que "
+                        f"el bloque no esta bien representado por {bmk} o que alguna IV ATM esta "
+                        "contaminada.")
+                info["rho_usado"] = rho_usado
+                mask = np.zeros((n, n), dtype=bool)
+                mask[np.ix_(idx, idx)] = True
+                np.fill_diagonal(mask, False)
+                regiones[nombre] = mask
+                objetivos[nombre] = rho_usado
+
+        if info["motivo"] is not None:
+            warnings.warn(f"Bloque '{nombre}' sin correlacion implicita ({info['motivo']}): "
+                          "conserva su correlacion historica.")
+
+    if not objetivos:
+        motivos = "; ".join(f"{b['bloque']}: {b['motivo']}" for b in detalle["bloques"] if b["motivo"])
+        return fallback(motivos or "ningun bloque pudo despejar su rho")
+
+    # --- pares entre bloques distintos --------------------------------------
+    mask_cruce = np.ones((n, n), dtype=bool)
+    for idx in idx_por_bloque.values():
+        mask_cruce[np.ix_(idx, idx)] = False
+    hay_cruce = bool(mask_cruce.any())
+    if hay_cruce:
+        detalle["rho_cruce_historico"] = _weighted_mean_corr(corr_hist, pair_w, mask_cruce)
+
+    # --- ensamblaje + proyeccion a definida positiva -------------------------
+    # La proyeccion espectral que garantiza PD corre el nivel de cada region, y
+    # cuanto mas cerca esta la matriz de ser singular mas lo corre. El lazo mide
+    # el nivel DESPUES de proyectar y devuelve la diferencia al objetivo interno
+    # de la biseccion, de modo que la matriz final sea simetrica, definida
+    # positiva Y siga cotizando el rho implicito de cada bloque.
+    internos = dict(objetivos)
+    mejor = None
+    for _ in range(max(1, implied_corr_block_repair)):
+        escalas, planas = {}, {}
+        for nombre, objetivo in internos.items():
+            k = (_solve_region_scale(corr_hist, pair_w, regiones[nombre], objetivo)
+                 if structure == "escalada" else None)
+            if k is None:
+                planas[nombre] = objetivo          # la forma historica no llega: nivel uniforme
+            else:
+                escalas[nombre] = k
+
+        k_cruce = None
+        if hay_cruce and cross == "escalada" and escalas:
+            masa = {nm: float((pair_w * regiones[nm]).sum()) for nm in escalas}
+            total_masa = sum(masa.values())
+            if total_masa > 1e-14:
+                k_cruce = sum(escalas[nm] * masa[nm] for nm in escalas) / total_masa
+
+        corr = _nearest_pd_corr(
+            _assemble_regions(corr_hist, regiones, escalas, planas, mask_cruce, k_cruce))
+
+        realizados = {nm: _weighted_mean_corr(corr, pair_w, regiones[nm]) for nm in regiones}
+        errores = [abs(realizados[nm] - objetivos[nm]) for nm in objetivos
+                   if np.isfinite(realizados[nm])]
+        err = max(errores) if errores else 0.0
+
+        if mejor is None or err < mejor[1]:
+            mejor = (corr, err, realizados, escalas, planas, k_cruce)
+        if err <= implied_corr_block_tol:
+            break
+
+        for nm in internos:
+            if np.isfinite(realizados[nm]):
+                internos[nm] = float(np.clip(internos[nm] + (objetivos[nm] - realizados[nm]),
+                                             -implied_corr_max_offdiag, implied_corr_max_offdiag))
+
+    corr, err, realizados, escalas, planas, k_cruce = mejor
+    if err > implied_corr_block_tol:
+        warnings.warn(f"El nivel implicito por bloque quedo a {err:.2e} de su objetivo despues de "
+                      f"{implied_corr_block_repair} pasadas: la proyeccion a definida positiva no "
+                      "deja acercarse mas sin romper la matriz. Se usa la mejor aproximacion.")
+
+    for info in detalle["bloques"]:
+        nm = info["bloque"]
+        if nm in regiones:
+            info["rho_efectivo"] = realizados[nm]
+            info["estructura"] = "plana" if nm in planas else "escalada"
+        elif nm in idx_por_bloque and len(idx_por_bloque[nm]) >= 2:
+            mask = np.zeros((n, n), dtype=bool)
+            mask[np.ix_(idx_por_bloque[nm], idx_por_bloque[nm])] = True
+            np.fill_diagonal(mask, False)
+            info["rho_efectivo"] = _weighted_mean_corr(corr, pair_w, mask)
+
+    # Resumen global ponderado por masa de pares, que es lo que consume el
+    # historial: un solo numero comparable entre corridas con y sin bloques.
+    masa = {nm: float((pair_w * regiones[nm]).sum()) for nm in regiones}
+    total_masa = sum(masa.values())
+    if total_masa > 1e-14:
+        crudo = {b["bloque"]: b["rho_despejado"] for b in detalle["bloques"]}
+        detalle["rho_despejado"] = sum(crudo[nm] * masa[nm] for nm in regiones) / total_masa
+        detalle["rho_usado"] = sum(objetivos[nm] * masa[nm] for nm in regiones) / total_masa
+        detalle["rho_efectivo"] = sum(
+            realizados[nm] * masa[nm] for nm in regiones) / total_masa
+
+    detalle["rho_matriz"] = _weighted_mean_corr(corr, pair_w)
+    if hay_cruce:
+        detalle["rho_cruce_efectivo"] = _weighted_mean_corr(corr, pair_w, mask_cruce)
+    detalle["estructura"] = ("plana" if planas and not escalas
+                             else "mixta" if planas else "escalada")
+    detalle["fuente"] = ("IMPLICITA_BLOQUES" if len(orden) > 1
+                         else "IMPLICITA_" + detalle["estructura"].upper())
+    return corr, detalle
+
+
 def euler_risk_attribution(tickers, weights, sigma, corr):
     # Descomposicion de Euler: sigma_p es homogenea de grado 1 en los pesos,
     # asi que MCR_i = d sigma_p / d w_i y los CTR_i suman sigma_p exacto.
@@ -846,7 +1276,8 @@ def euler_risk_attribution(tickers, weights, sigma, corr):
     return tabla, metricas, cov
 
 
-def build_risk_inputs(analyses, tickers, api_key=polygon_api_key):
+def build_risk_inputs(analyses, tickers, api_key=polygon_api_key, portfolio=None,
+                      horizon_days=investment_horizon_days):
     prices = get_price_history(tickers, api_key=api_key)
 
     # Un activo entra en la capa de riesgo solo si tiene volatilidad Y
@@ -877,11 +1308,39 @@ def build_risk_inputs(analyses, tickers, api_key=polygon_api_key):
         warnings.warn("Menos de 2 activos utilizables: se omite la capa de riesgo de portafolio.")
         return None
 
+    sigma = np.asarray(sigmas, dtype=float)
+
+    # Pesos con los que se despeja el rho implicito: son los pesos de la canasta
+    # dentro de la ecuacion de dispersion, no los pesos tacticos que despues
+    # ajusta el guardrail. Se toman los pesos vigentes del portafolio y se
+    # renormalizan sobre los activos que si entraron a la capa de riesgo.
+    if implied_corr_weights == "portafolio" and portfolio:
+        pesos = np.array([float(portfolio.get(tk, 0.0)) for tk in validos], dtype=float)
+        if not np.isfinite(pesos).all() or pesos.sum() <= 0:
+            pesos = np.ones(len(validos), dtype=float)
+    else:
+        pesos = np.ones(len(validos), dtype=float)
+    pesos = pesos / pesos.sum()
+
+    if corr_source == "implicita":
+        _, _, benchmarks = resolve_corr_blocks(validos)
+        sigmas_benchmark = benchmark_implied_sigmas(analyses, benchmarks, horizon_days, api_key)
+        corr, corr_detalle = build_implied_correlation(
+            prices, validos, sigma, fuentes, pesos, sigmas_benchmark)
+    else:
+        corr = estimate_correlation(prices[validos])
+        corr_detalle = {"fuente": f"HISTORICA_{corr_method.upper()}",
+                        "estructura": corr_method,
+                        "motivo_fallback": "corr_source = 'historica'"}
+
     return {
         "tickers": validos,
-        "sigma": np.asarray(sigmas, dtype=float),
+        "sigma": sigma,
         "fuente_vol": fuentes,
-        "corr": estimate_correlation(prices[validos]),
+        "corr": corr,
+        "corr_fuente": corr_detalle.get("fuente"),
+        "corr_detalle": corr_detalle,
+        "pesos_referencia": pesos,
         "prices": prices,
         "excluidos": excluidos,
     }
@@ -1002,6 +1461,8 @@ def apply_diversification_guardrail(tabla_rebalanceo, risk_inputs,
         "metricas_antes": metricas_antes,
         "metricas_despues": metricas_despues,
         "correlacion": pd.DataFrame(corr, index=tickers, columns=tickers),
+        "corr_fuente": risk_inputs.get("corr_fuente") or f"HISTORICA_{corr_method.upper()}",
+        "corr_detalle": risk_inputs.get("corr_detalle", {}),
         "fuente_vol": dict(zip(risk_inputs["tickers"], risk_inputs["fuente_vol"])),
         "excluidos": risk_inputs.get("excluidos", []),
         "caja_por_guardrail": caja_extra,
@@ -1062,15 +1523,39 @@ def evaluar_regimen_riesgo(risk_report, hist_df):
     return resultado
 
 
+def resumen_bloques_historial(corr_detalle):
+    # Los rho por bloque en una sola celda del CSV: el historial vive de comparar
+    # corridas entre si, y una columna por bloque cambiaria de forma cada vez que
+    # se reconfigura implied_corr_blocks.
+    bloques = (corr_detalle or {}).get("bloques") or []
+    partes = [f"{b['bloque']}({b['benchmark']}):{b['rho_usado']:.3f}"
+              for b in bloques if np.isfinite(b.get("rho_usado", np.nan))]
+    return "|".join(partes) if partes else None
+
+
+def iv_benchmark_historial(corr_detalle):
+    bloques = (corr_detalle or {}).get("bloques") or []
+    partes = [f"{b['benchmark']}:{100*b['sigma_benchmark']:.2f}"
+              for b in bloques if np.isfinite(b.get("sigma_benchmark", np.nan))]
+    return "|".join(partes) if partes else None
+
+
 def registrar_historial_riesgo(risk_report, hist_df):
     if risk_report is None:
         warnings.warn("Sin capa de riesgo en esta corrida: no se registra en el historial.")
         return hist_df
 
     ma, md = risk_report["metricas_antes"], risk_report["metricas_despues"]
+    cd = risk_report.get("corr_detalle") or {}
     fila = pd.DataFrame([{
         "fecha": datetime.now(),
         "corr_method": corr_method,
+        "corr_fuente": risk_report.get("corr_fuente"),
+        "rho_implicito_despejado": cd.get("rho_despejado", np.nan),
+        "rho_implicito_usado": cd.get("rho_usado", np.nan),
+        "rho_implicito_bloques": resumen_bloques_historial(cd),
+        "rho_cruce_bloques": cd.get("rho_cruce_efectivo", np.nan),
+        "iv_benchmark": iv_benchmark_historial(cd),
         "cash_reserve_limit": cash_reserve_limit,
         "vol_portafolio_antes": ma["vol_portafolio"],
         "vol_portafolio_despues": md["vol_portafolio"],
@@ -1323,6 +1808,8 @@ def print_risk_report(reporte):
     print("\n-- Fuente de la volatilidad por activo --")
     print(" | ".join(f"{tk}: {src}" for tk, src in reporte["fuente_vol"].items()))
 
+    print_implied_correlation(reporte)
+
     if reporte["excluidos"]:
         print("\n-- Activos FUERA de la capa de riesgo (peso sin ajustar) --")
         for tk, motivo in reporte["excluidos"]:
@@ -1339,6 +1826,50 @@ def print_risk_report(reporte):
     print("==============================================================")
 
 
+def print_implied_correlation(reporte):
+    cd = reporte.get("corr_detalle") or {}
+    fuente = reporte.get("corr_fuente", "?")
+
+    print("\n-- Correlacion usada en la matriz de covarianza --")
+    print(f"  Fuente: {fuente}")
+
+    if str(fuente).startswith("HISTORICA"):
+        if cd.get("motivo_fallback"):
+            print(f"  Motivo: {cd['motivo_fallback']}")
+        if np.isfinite(cd.get("rho_historico", np.nan)):
+            print(f"  Rho medio historico (ponderado por par): {cd['rho_historico']:.3f}")
+        return
+
+    bloques = cd.get("bloques") or []
+    if bloques:
+        tabla = pd.DataFrame([{
+            "Bloque": b["bloque"],
+            "Benchmark": b["benchmark"],
+            "Activos": ",".join(b["tickers"]),
+            "Peso_Pct": 100.0 * b.get("peso", np.nan),
+            "IV_Bmk_Pct": 100.0 * b["sigma_benchmark"],
+            "Rho_Despejado": b["rho_despejado"],
+            "Rho_Aplicado": b["rho_usado"],
+            "Rho_Efectivo": b["rho_efectivo"],
+            "Cobertura_IV_Pct": 100.0 * b["cobertura_iv"],
+            "Estructura": b["estructura"],
+        } for b in bloques])
+        print(tabla.round(3).to_string(index=False))
+        for b in bloques:
+            if b["motivo"]:
+                print(f"  [{b['bloque']}] sin rho implicito: {b['motivo']}")
+
+    print(f"  Rho medio de la matriz final: {cd.get('rho_matriz', float('nan')):.3f} "
+          f"| historico ({corr_method}) de referencia: "
+          f"{cd.get('rho_historico', float('nan')):.3f}")
+    if np.isfinite(cd.get("rho_cruce_historico", np.nan)):
+        print(f"  Pares entre bloques ({cd.get('cross_block')}): "
+              f"{cd.get('rho_cruce_efectivo', float('nan')):.3f} "
+              f"(historico {cd['rho_cruce_historico']:.3f})")
+    print(f"  Estructura: {cd.get('estructura')} | cobertura de IV en el peso: "
+          f"{100*cd.get('cobertura_iv', float('nan')):.0f}%")
+
+
 def plot_risk_attribution(reporte):
     if reporte is None:
         return None
@@ -1351,7 +1882,8 @@ def plot_risk_attribution(reporte):
     fig = make_subplots(
         rows=1, cols=2, column_widths=[0.58, 0.42],
         subplot_titles=("Contribucion al riesgo total (CTR %)",
-                        f"Correlacion ({corr_method.upper()}) entre activos"),
+                        f"Correlacion ({reporte.get('corr_fuente', corr_method.upper())}) "
+                        "entre activos"),
     )
 
     fig.add_trace(go.Bar(x=labels, y=antes.loc[orden, "CTR_Pct"], name="Antes del guardrail",
@@ -1405,7 +1937,8 @@ def run_active_management_engine(portfolio, horizon_days, api_key, cash_limit):
     # El scoring tactico es transversal y ciego a la correlacion: la capa de
     # riesgo revisa su propuesta y recorta las concentraciones de riesgo.
     print("\nConstruyendo la capa de riesgo de portafolio...")
-    risk_inputs = build_risk_inputs(analyses, tickers, api_key)
+    risk_inputs = build_risk_inputs(analyses, tickers, api_key,
+                                    portfolio=portfolio, horizon_days=horizon_days)
     tabla_rebalanceo, risk_report = apply_diversification_guardrail(tabla_tactica, risk_inputs)
 
     dashboard = generate_executive_dashboard(tabla_rebalanceo)
