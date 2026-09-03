@@ -2,9 +2,6 @@
 # PORTFOLIO VIX ENGINE
 # Indice de volatilidad implicita "model-free" (metodologia CBOE extendida a
 # portafolios de N acciones / ETFs) sobre cadenas de opciones de Polygon.io.
-#
-# EDITA EL PORTAFOLIO Y SUS PONDERACIONES EN: PORTFOLIO_HOLDINGS (BLOQUE 1).
-# Requiere POLYGON_API_KEY en el archivo .env. Salida: informe HTML interactivo.
 # ==============================================================================
 
 from __future__ import annotations
@@ -54,13 +51,6 @@ except Exception:  # pragma: no cover
 # Composicion del portafolio, tasa libre de riesgo, rutas de salida y
 # parametros de descarga de Polygon. Es el unico bloque pensado para tocar.
 # ==============================================================================
-# Composición del portafolio: ticker -> ponderación.
-#   * Los pesos pueden estar en tanto por uno (0.12) o en porcentaje (12); en
-#     ambos casos se normalizan para que sumen 1.
-#   * Pon ``None`` en un peso (o EQUAL_WEIGHTS = True) para tratar el
-#     portafolio como equiponderado.
-#   * Si un activo no puede valorarse (sin cadena de opciones utilizable), se
-#     excluye y el resto de pesos se renormaliza automáticamente.
 PORTFOLIO_HOLDINGS: Dict[str, Optional[float]] = {
     "XLU": 0.1200,
     "GLD": 0.1200,
