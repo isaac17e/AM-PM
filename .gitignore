@@ -5,3 +5,4 @@ __pycache__/
 .DS_Store
 entry_signal_history.csv
 entry_state.json
+portfolio_vix_report.html
