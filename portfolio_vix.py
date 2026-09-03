@@ -1,15 +1,11 @@
-"""
-================================================================================
- PORTFOLIO VIX ENGINE  --  Índice de volatilidad implícita "model-free" para
-                           portafolios de N activos (acciones / ETFs).
-================================================================================
-
- PARA EDITAR EL PORTAFOLIO Y SUS PONDERACIONES: diccionario PORTFOLIO_HOLDINGS,
- en el bloque "CONFIGURACIÓN DEL PORTAFOLIO", justo debajo de los imports.
-
- Datos de opciones: Polygon.io (requiere POLYGON_API_KEY en el archivo .env).
- Salida: informe interactivo en HTML (Plotly).
-"""
+# ==============================================================================
+# PORTFOLIO VIX ENGINE
+# Indice de volatilidad implicita "model-free" (metodologia CBOE extendida a
+# portafolios de N acciones / ETFs) sobre cadenas de opciones de Polygon.io.
+#
+# EDITA EL PORTAFOLIO Y SUS PONDERACIONES EN: PORTFOLIO_HOLDINGS (BLOQUE 1).
+# Requiere POLYGON_API_KEY en el archivo .env. Salida: informe HTML interactivo.
+# ==============================================================================
 
 from __future__ import annotations
 
@@ -54,7 +50,9 @@ except Exception:  # pragma: no cover
 
 
 # ==============================================================================
-# CONFIGURACIÓN DEL PORTAFOLIO  <<<  EDITA AQUÍ  >>>
+# BLOQUE 1: CONFIGURACION  <<<  EDITA AQUI  >>>
+# Composicion del portafolio, tasa libre de riesgo, rutas de salida y
+# parametros de descarga de Polygon. Es el unico bloque pensado para tocar.
 # ==============================================================================
 # Composición del portafolio: ticker -> ponderación.
 #   * Los pesos pueden estar en tanto por uno (0.12) o en porcentaje (12); en
@@ -112,7 +110,9 @@ STOCKS_THROTTLE_SECONDS: float = 13.0    # respeta el límite de 5/min del tier 
 
 
 # ==============================================================================
-# CONSTANTES DE CALENDARIO (convención CBOE: todo se mide en minutos)
+# BLOQUE 2: CONSTANTES DE CALENDARIO Y TIPOS
+# Convencion CBOE: el tiempo se mide en minutos sobre base 365. Aqui viven
+# tambien los alias de tipos y los helpers que leen PORTFOLIO_HOLDINGS.
 # ==============================================================================
 MINUTES_PER_YEAR: float = 525_600.0      # N_365
 MINUTES_PER_30D: float = 43_200.0        # N_30
@@ -125,17 +125,10 @@ DataSource = Literal["polygon", "yahoo", "synthetic"]
 
 
 def portfolio_tickers() -> List[str]:
-    """Tickers declarados en :data:`PORTFOLIO_HOLDINGS`."""
     return list(PORTFOLIO_HOLDINGS.keys())
 
 
 def portfolio_weights() -> Optional[List[float]]:
-    """Pesos normalizados del portafolio.
-
-    Returns:
-        Lista de pesos que suma 1, o ``None`` (equiponderado) si
-        :data:`EQUAL_WEIGHTS` es ``True`` o algún peso está sin declarar.
-    """
     if EQUAL_WEIGHTS:
         return None
     raw = list(PORTFOLIO_HOLDINGS.values())
@@ -149,25 +142,13 @@ def portfolio_weights() -> Optional[List[float]]:
 
 
 # ==============================================================================
-# 0. NÚCLEO DE VALORACIÓN: BLACK-SCHOLES, BLACK-76, BJERKSUND-STENSLAND, CRR
+# BLOQUE 3: NUCLEO DE VALORACION
+# Black-Scholes-Merton y Black-76 para europeas; Bjerksund-Stensland 1993 y
+# arbol CRR para americanas; inversion a volatilidad implicita por brentq.
 # ==============================================================================
 def bs_price(
     S: float, K: float, T: float, r: float, q: float, sigma: float, kind: str
 ) -> float:
-    """Precio Black-Scholes-Merton europeo con dividendo continuo.
-
-    Args:
-        S: Precio spot del subyacente.
-        K: Strike.
-        T: Tiempo a vencimiento en años.
-        r: Tasa libre de riesgo continua.
-        q: Dividend yield continuo.
-        sigma: Volatilidad anualizada.
-        kind: ``'call'`` o ``'put'``.
-
-    Returns:
-        Precio teórico europeo.
-    """
     if T <= 0 or sigma <= 0:
         intrinsic = (S - K) if kind == "call" else (K - S)
         return max(intrinsic, 0.0)
@@ -180,22 +161,6 @@ def bs_price(
 
 
 def black76_price(F: float, K: float, T: float, r: float, sigma: float, kind: str) -> float:
-    """Precio Black-76 europeo sobre el forward implícito.
-
-    Se usa para repreciar la sonrisa interpolada de forma consistente con el
-    forward extraído por paridad put-call, evitando reintroducir error de carry.
-
-    Args:
-        F: Forward implícito del subyacente al vencimiento.
-        K: Strike.
-        T: Tiempo a vencimiento en años.
-        r: Tasa libre de riesgo continua (aquí sólo descuenta).
-        sigma: Volatilidad implícita del strike.
-        kind: ``'call'`` o ``'put'``.
-
-    Returns:
-        Precio europeo descontado.
-    """
     if T <= 0 or sigma <= 0:
         intrinsic = (F - K) if kind == "call" else (K - F)
         return math.exp(-r * T) * max(intrinsic, 0.0)
@@ -209,7 +174,6 @@ def black76_price(F: float, K: float, T: float, r: float, sigma: float, kind: st
 
 
 def _euro_call_carry(S: float, K: float, T: float, r: float, b: float, sigma: float) -> float:
-    """Call europea generalizada con cost-of-carry ``b`` (``b = r - q``)."""
     if T <= 0 or sigma <= 0:
         return max(S - K, 0.0)
     sT = sigma * math.sqrt(T)
@@ -221,7 +185,6 @@ def _euro_call_carry(S: float, K: float, T: float, r: float, b: float, sigma: fl
 def _phi(
     S: float, T: float, gamma: float, H: float, I: float, r: float, b: float, sigma: float
 ) -> float:
-    """Función auxiliar ``phi`` de Bjerksund-Stensland (1993)."""
     v2 = sigma**2
     sT = sigma * math.sqrt(T)
     lam = (-r + gamma * b + 0.5 * gamma * (gamma - 1.0) * v2) * T
@@ -234,19 +197,6 @@ def _phi(
 def bjerksund_stensland_call(
     S: float, K: float, T: float, r: float, b: float, sigma: float
 ) -> float:
-    """Call americana por la aproximación de frontera plana de Bjerksund-Stensland (1993).
-
-    Args:
-        S: Spot.
-        K: Strike.
-        T: Tiempo a vencimiento en años.
-        r: Tasa libre de riesgo continua.
-        b: Cost of carry (``b = r - q``).
-        sigma: Volatilidad anualizada.
-
-    Returns:
-        Precio de la call americana (siempre >= precio europeo).
-    """
     if T <= 0 or sigma <= 0:
         return max(S - K, 0.0)
     if b >= r:  # sin dividendos el ejercicio anticipado de la call nunca es óptimo
@@ -282,11 +232,6 @@ def bjerksund_stensland_call(
 def bjerksund_stensland_price(
     S: float, K: float, T: float, r: float, q: float, sigma: float, kind: str
 ) -> float:
-    """Precio americano (call o put) vía Bjerksund-Stensland 1993.
-
-    La put se obtiene con la transformación de simetría
-    ``P(S, K, T, r, b) = C(K, S, T, r - b, -b)``.
-    """
     b = r - q
     if kind == "call":
         return bjerksund_stensland_call(S, K, T, r, b, sigma)
@@ -296,19 +241,6 @@ def bjerksund_stensland_price(
 def crr_american(
     S: float, K: float, T: float, r: float, q: float, sigma: float, kind: str, steps: int = 201
 ) -> float:
-    """Precio americano por árbol binomial Cox-Ross-Rubinstein (vectorizado en NumPy).
-
-    Alternativa de referencia a Bjerksund-Stensland: más lenta pero converge al
-    valor exacto bajo GBM. Útil para validar la de-americanización.
-
-    Args:
-        S, K, T, r, q, sigma: Parámetros habituales.
-        kind: ``'call'`` o ``'put'``.
-        steps: Número de pasos del árbol.
-
-    Returns:
-        Precio americano.
-    """
     if T <= 0 or sigma <= 0:
         return max((S - K) if kind == "call" else (K - S), 0.0)
     dt = T / steps
@@ -343,25 +275,6 @@ def implied_vol(
     lo: float = 1e-3,
     hi: float = 5.0,
 ) -> float:
-    """Invierte el precio de mercado para obtener la volatilidad implícita.
-
-    Args:
-        price: Precio observado (mid).
-        S: Spot.
-        K: Strike.
-        T: Tiempo a vencimiento en años.
-        r: Tasa libre de riesgo.
-        q: Dividend yield continuo.
-        kind: ``'call'`` o ``'put'``.
-        style: ``'american'`` usa el modelo con ejercicio anticipado; ``'european'`` usa BSM.
-        engine: Motor americano (``'bs1993'`` o ``'crr'``).
-        lo: Extremo inferior del bracket de sigma.
-        hi: Extremo superior del bracket de sigma.
-
-    Returns:
-        Volatilidad implícita, o ``np.nan`` si el precio queda fuera de los
-        límites de no-arbitraje del modelo.
-    """
     if not np.isfinite(price) or price <= 0.0 or T <= 0.0:
         return float("nan")
 
@@ -388,18 +301,12 @@ def implied_vol(
 
 
 # ==============================================================================
-# ESTRUCTURAS DE DATOS
+# BLOQUE 4: ESTRUCTURAS DE DATOS
+# Contenedores que viajan entre modulos: corte por vencimiento, datos de
+# mercado de un activo (con su calendario de dividendos) y ajuste de sonrisa.
 # ==============================================================================
 @dataclass
 class ExpirySlice:
-    """Corte de la superficie de volatilidad para un vencimiento concreto.
-
-    Attributes:
-        T: Tiempo a vencimiento en años (base 365, resolución de minutos).
-        chain: DataFrame con columnas ``['strike', 'type', 'bid', 'ask']``.
-        label: Etiqueta legible (fecha de vencimiento).
-    """
-
     T: float
     chain: pd.DataFrame
     label: str = ""
@@ -407,18 +314,6 @@ class ExpirySlice:
 
 @dataclass
 class AssetMarketData:
-    """Datos de mercado de un activo del portafolio.
-
-    Attributes:
-        ticker: Símbolo.
-        spot: Precio spot.
-        q: Dividend yield continuo anualizado (convención de respaldo).
-        slices: Cortes de la superficie por vencimiento.
-        history: Serie de cierres para la correlación.
-        dividends: Dividendos discretos futuros ``(fecha ex, importe)``. Si la
-            lista no está vacía se usa el modelo *escrowed* en vez de ``q``.
-    """
-
     ticker: str
     spot: float
     q: float
@@ -429,8 +324,6 @@ class AssetMarketData:
 
 @dataclass
 class SmileFit:
-    """Resultado de la construcción de la sonrisa para un vencimiento."""
-
     T: float
     forward: float
     K0: float
@@ -446,31 +339,16 @@ class SmileFit:
 
 
 # ==============================================================================
-# 1. MÓDULO DE PREPROCESAMIENTO Y LIMPIEZA DE CADENAS
+# BLOQUE 5: LIMPIEZA DE CADENAS Y DE-AMERICANIZACION
+# Filtros de no-arbitraje estatico (cotizaciones, spread, cotas, monotonia y
+# convexidad) y extraccion de la volatilidad europea equivalente: se invierte
+# el precio con modelo americano y se repricia como europea, lo que elimina
+# la prima de ejercicio anticipado. Resuelve el sesgo de estilo americano.
 # ==============================================================================
 class OptionChainCleaner:
-    """Limpieza de cadenas y filtros de no-arbitraje estático.
-
-    Filtros aplicados en orden:
-        1. Cotizaciones inválidas (``bid <= 0``, ``ask <= bid``, ``mid <= 0``, NaN).
-        2. Spread relativo excesivo (ruido de mercado ilíquido).
-        3. Límites de no-arbitraje: precio por encima del valor intrínseco
-           descontado y por debajo de la cota superior (``S e^{-qT}`` para calls,
-           ``K e^{-rT}`` para puts).
-        4. Monotonicidad en el strike (dominancia estricta): calls decrecientes,
-           puts crecientes.
-        5. Convexidad: mariposas no negativas sobre strikes no equiespaciados.
-    """
-
     def __init__(
         self, max_rel_spread: float = 0.85, min_points_per_side: int = 4, verbose: bool = True
     ) -> None:
-        """
-        Args:
-            max_rel_spread: Spread bid-ask máximo admitido, en unidades de mid.
-            min_points_per_side: Mínimo de cotizaciones por lado antes de advertir.
-            verbose: Imprime diagnóstico de la limpieza.
-        """
         self.max_rel_spread = max_rel_spread
         self.min_points_per_side = min_points_per_side
         self.verbose = verbose
@@ -478,7 +356,6 @@ class OptionChainCleaner:
     # -- utilidades ------------------------------------------------------------
     @staticmethod
     def _monotonic_mask(strikes: np.ndarray, prices: np.ndarray, kind: str) -> np.ndarray:
-        """Máscara que conserva un subconjunto monótono mediante barrido codicioso."""
         keep = np.ones(len(strikes), dtype=bool)
         if kind == "call":  # C(K) decreciente en K
             best = np.inf
@@ -498,7 +375,6 @@ class OptionChainCleaner:
 
     @staticmethod
     def _convexity_mask(strikes: np.ndarray, prices: np.ndarray) -> np.ndarray:
-        """Elimina iterativamente los puntos que violan la convexidad (mariposa < 0)."""
         keep = np.ones(len(strikes), dtype=bool)
         changed = True
         while changed and keep.sum() >= 3:
@@ -518,19 +394,6 @@ class OptionChainCleaner:
     def clean(
         self, chain: pd.DataFrame, S: float, T: float, r: float, q: float, tag: str = ""
     ) -> pd.DataFrame:
-        """Limpia la cadena completa (calls + puts) de un vencimiento.
-
-        Args:
-            chain: DataFrame con ``['strike', 'type', 'bid', 'ask']``.
-            S: Spot.
-            T: Tiempo a vencimiento en años.
-            r: Tasa libre de riesgo.
-            q: Dividend yield.
-            tag: Etiqueta usada en los mensajes de advertencia.
-
-        Returns:
-            DataFrame limpio con la columna adicional ``mid``.
-        """
         df = chain.copy()
         n0 = len(df)
         for col in ("strike", "bid", "ask"):
@@ -584,48 +447,13 @@ class OptionChainCleaner:
 
 
 class DeAmericanizer:
-    """Extrae la volatilidad implícita europea equivalente de opciones americanas.
-
-    Procedimiento estándar de de-americanización:
-        1. Invertir el precio americano de mercado con un modelo de ejercicio
-           anticipado (Bjerksund-Stensland 1993 o árbol CRR) para obtener
-           ``sigma_amer``.
-        2. Repreciar la misma opción como europea (BSM) con ``sigma_amer``. La
-           diferencia respecto al precio de mercado es exactamente la prima de
-           ejercicio anticipado, que queda así eliminada.
-
-    Note:
-        Con ``q = 0`` la call americana coincide con la europea, de modo que el
-        ajuste sólo afecta materialmente al lado de las puts. Con dividendos
-        discretos conviene pasar un ``q`` "escrowed" equivalente.
-    """
-
     def __init__(self, engine: AmericanEngine = "bs1993", verbose: bool = True) -> None:
-        """
-        Args:
-            engine: Motor de valoración americana usado en la inversión.
-            verbose: Imprime la prima media de ejercicio anticipado eliminada.
-        """
         self.engine = engine
         self.verbose = verbose
 
     def transform(
         self, chain: pd.DataFrame, S: float, T: float, r: float, q: float, tag: str = ""
     ) -> pd.DataFrame:
-        """Añade las columnas ``iv`` (europea equivalente) y ``price_eu``.
-
-        Args:
-            chain: Cadena limpia con columna ``mid``.
-            S: Spot.
-            T: Tiempo a vencimiento.
-            r: Tasa libre de riesgo.
-            q: Dividend yield.
-            tag: Etiqueta de diagnóstico.
-
-        Returns:
-            Cadena con IV europea y precio europeo; las filas sin inversión
-            válida se descartan.
-        """
         ivs, prices_eu, premia = [], [], []
         for _, row in chain.iterrows():
             k, kind, mid = float(row["strike"]), str(row["type"]), float(row["mid"])
@@ -653,21 +481,13 @@ class DeAmericanizer:
 
 
 # ==============================================================================
-# 2. INTERPOLACIÓN Y CONSTRUCCIÓN DE LA SONRISA (RESOLUCIÓN DE ILIQUIDEZ)
+# BLOQUE 6: CONSTRUCCION DE LA SONRISA
+# Ajuste SVI raw (con test de mariposa de Gatheral y guardia de R2 contra
+# ajustes planos) o spline cubico sobre varianza total, y generacion de una
+# grilla densa de strikes. Resuelve los agujeros de las cadenas iliquidas:
+# la integral corre sobre la grilla densa, no sobre los strikes observados.
 # ==============================================================================
 class SmileBuilder:
-    """Ajusta la sonrisa en log-moneyness y genera una grilla densa de strikes.
-
-    Métodos disponibles:
-        * ``'spline'``: spline cúbico natural sobre la **varianza total**
-          ``w(k) = sigma^2 T`` con extrapolación lineal en las alas, lo que
-          garantiza ``w > 0`` y pendientes acotadas.
-        * ``'svi'``: parametrización SVI raw
-          ``w(k) = a + b [rho (k - m) + sqrt((k - m)^2 + s^2)]`` ajustada por
-          mínimos cuadrados robustos, con test de mariposa de Gatheral y
-          degradación automática a spline si el ajuste genera arbitraje.
-    """
-
     def __init__(
         self,
         method: VolMethod = "svi",
@@ -677,18 +497,6 @@ class SmileBuilder:
         min_svi_r2: float = 0.60,
         verbose: bool = True,
     ) -> None:
-        """
-        Args:
-            method: ``'spline'`` o ``'svi'``.
-            n_grid: Número de strikes de la grilla densa.
-            wing_ext_sd: Extensión de las alas más allá del rango observado, en
-                unidades de ``sigma_atm * sqrt(T)``.
-            max_sd: Tope absoluto de log-moneyness en unidades de sigma·sqrt(T).
-            min_svi_r2: Fracción mínima de la varianza de ``w`` explicada por la
-                SVI; por debajo se considera un ajuste degenerado (la pérdida
-                robusta ha aplanado la sonrisa) y se degrada a spline.
-            verbose: Imprime diagnóstico.
-        """
         self.method = method
         self.n_grid = n_grid
         self.wing_ext_sd = wing_ext_sd
@@ -699,16 +507,10 @@ class SmileBuilder:
     # -- SVI -------------------------------------------------------------------
     @staticmethod
     def _svi_w(params: np.ndarray, k: np.ndarray) -> np.ndarray:
-        """Varianza total SVI raw evaluada en log-moneyness ``k``."""
         a, b, rho, m, s = params
         return a + b * (rho * (k - m) + np.sqrt((k - m) ** 2 + s**2))
 
     def _fit_svi(self, k: np.ndarray, w: np.ndarray) -> Optional[np.ndarray]:
-        """Ajusta SVI raw por mínimos cuadrados acotados.
-
-        Returns:
-            Vector de parámetros ``(a, b, rho, m, s)`` o ``None`` si falla.
-        """
         if len(k) < 5:
             return None
         w_atm = float(np.interp(0.0, k, w))
@@ -730,7 +532,6 @@ class SmileBuilder:
 
     @staticmethod
     def _butterfly_g(params: np.ndarray, k: np.ndarray) -> np.ndarray:
-        """Función ``g`` de Gatheral; ``g >= 0`` implica ausencia de arbitraje mariposa."""
         a, b, rho, m, s = params
         x = k - m
         root = np.sqrt(x**2 + s**2)
@@ -742,7 +543,6 @@ class SmileBuilder:
     # -- Spline ----------------------------------------------------------------
     @staticmethod
     def _spline_fn(k: np.ndarray, w: np.ndarray) -> Callable[[np.ndarray], np.ndarray]:
-        """Construye un spline cúbico natural sobre varianza total con alas lineales."""
         if len(k) >= 4:
             cs = CubicSpline(k, w, bc_type="natural", extrapolate=False)
             d_lo, d_hi = float(cs(k[0], 1)), float(cs(k[-1], 1))
@@ -766,21 +566,6 @@ class SmileBuilder:
     def build(
         self, strikes: np.ndarray, ivs: np.ndarray, F: float, T: float, tag: str = ""
     ) -> Tuple[np.ndarray, np.ndarray, str]:
-        """Construye la grilla densa ``(strikes, IV)`` a partir de puntos observados.
-
-        Args:
-            strikes: Strikes observados.
-            ivs: Volatilidades implícitas europeas correspondientes.
-            F: Forward implícito.
-            T: Tiempo a vencimiento.
-            tag: Etiqueta de diagnóstico.
-
-        Returns:
-            Tupla ``(strikes_dense, iv_dense, method_used)``.
-
-        Raises:
-            ValueError: Si quedan menos de 3 puntos válidos.
-        """
         order = np.argsort(strikes)
         k_raw = np.log(np.asarray(strikes, dtype=float)[order] / F)
         iv_raw = np.asarray(ivs, dtype=float)[order]
@@ -845,44 +630,18 @@ class SmileBuilder:
 
 
 # ==============================================================================
-# 3. MOTOR CBOE MODEL-FREE VARIANCE
+# BLOQUE 7: MOTOR CBOE MODEL-FREE VARIANCE
+# Forward implicito por paridad put-call (no depende del dividend yield),
+# seleccion OTM alrededor de K0, integracion discreta con pesos dK/K^2 e
+# interpolacion temporal en minutos hacia el horizonte de 30 dias.
 # ==============================================================================
 class CBOEVarianceEngine:
-    """Algoritmo de varianza libre de modelo de la CBOE (VIX White Paper).
-
-    Pasos por vencimiento:
-        1. ``K*`` = strike que minimiza ``|C(K) - P(K)|``.
-        2. ``F = K* + e^{rT} (C(K*) - P(K*))``.
-        3. ``K0`` = mayor strike menor o igual que ``F``.
-        4. Selección OTM: puts para ``K < K0``, calls para ``K > K0``, promedio
-           call/put en ``K0``.
-        5. Integración discreta con pesos ``dK / K^2``.
-        6. Interpolación temporal en minutos hacia el horizonte de 30 días.
-    """
-
     def __init__(self, r: float, verbose: bool = True) -> None:
-        """
-        Args:
-            r: Tasa libre de riesgo continua.
-            verbose: Imprime diagnóstico.
-        """
         self.r = r
         self.verbose = verbose
 
     # -- forward ---------------------------------------------------------------
     def implied_forward(self, chain: pd.DataFrame, T: float) -> Tuple[float, float]:
-        """Calcula el forward implícito por paridad put-call.
-
-        Args:
-            chain: Cadena de-americanizada con ``strike``, ``type`` y ``price_eu``.
-            T: Tiempo a vencimiento en años.
-
-        Returns:
-            Tupla ``(F, K_star)``.
-
-        Raises:
-            ValueError: Si no hay ningún strike con call y put simultáneas.
-        """
         piv = chain.pivot_table(
             index="strike", columns="type", values="price_eu", aggfunc="mean"
         ).dropna()
@@ -899,7 +658,6 @@ class CBOEVarianceEngine:
     # -- integración -----------------------------------------------------------
     @staticmethod
     def _delta_k(strikes: np.ndarray) -> np.ndarray:
-        """Ancho de intervalo CBOE: centrado en el interior, unilateral en los bordes."""
         dk = np.empty_like(strikes, dtype=float)
         dk[1:-1] = (strikes[2:] - strikes[:-2]) / 2.0
         dk[0] = strikes[1] - strikes[0]
@@ -909,20 +667,6 @@ class CBOEVarianceEngine:
     def variance(
         self, strikes: np.ndarray, iv: np.ndarray, F: float, T: float
     ) -> Tuple[float, float, np.ndarray, np.ndarray]:
-        """Varianza model-free de un vencimiento sobre la grilla densa.
-
-        Args:
-            strikes: Grilla densa de strikes.
-            iv: Volatilidades implícitas en esa grilla.
-            F: Forward implícito.
-            T: Tiempo a vencimiento en años.
-
-        Returns:
-            Tupla ``(sigma2, K0, otm_prices, dk)``.
-
-        Raises:
-            ValueError: Si no hay strikes por debajo del forward.
-        """
         below = strikes[strikes <= F]
         if below.size == 0:
             raise ValueError("ningún strike por debajo del forward: grilla insuficiente")
@@ -950,17 +694,6 @@ class CBOEVarianceEngine:
     def interpolate_30d(
         T1: float, var1: float, T2: Optional[float], var2: Optional[float]
     ) -> float:
-        """Interpolación temporal CBOE ponderada por minutos hacia 30 días.
-
-        Args:
-            T1: Vencimiento near-term en años.
-            var1: Varianza anualizada del near-term.
-            T2: Vencimiento next-term en años, o ``None``.
-            var2: Varianza anualizada del next-term, o ``None``.
-
-        Returns:
-            Varianza anualizada a 30 días.
-        """
         if T2 is None or var2 is None:
             warnings.warn(
                 "Sólo hay un vencimiento disponible: se usa su varianza sin interpolar "
@@ -986,8 +719,6 @@ class CBOEVarianceEngine:
 
 
 class SingleAssetVIX:
-    """Orquesta los módulos 1-3 para producir el VIX a 30 días de un activo."""
-
     def __init__(
         self,
         r: float,
@@ -996,14 +727,6 @@ class SingleAssetVIX:
         smiler: SmileBuilder,
         verbose: bool = True,
     ) -> None:
-        """
-        Args:
-            r: Tasa libre de riesgo continua.
-            cleaner: Instancia de :class:`OptionChainCleaner`.
-            deamer: Instancia de :class:`DeAmericanizer`.
-            smiler: Instancia de :class:`SmileBuilder`.
-            verbose: Imprime diagnóstico por vencimiento.
-        """
         self.r = r
         self.cleaner = cleaner
         self.deamer = deamer
@@ -1012,17 +735,6 @@ class SingleAssetVIX:
         self.verbose = verbose
 
     def compute(self, data: AssetMarketData) -> Tuple[float, List[SmileFit]]:
-        """Calcula la varianza implícita a 30 días del activo.
-
-        Args:
-            data: Datos de mercado del activo.
-
-        Returns:
-            Tupla ``(sigma2_30d, lista de SmileFit)``.
-
-        Raises:
-            ValueError: Si ningún vencimiento produce una varianza válida.
-        """
         if self.verbose:
             div_txt = (
                 f"{len(data.dividends)} dividendo(s) discreto(s)"
@@ -1110,30 +822,12 @@ class SingleAssetVIX:
 
 
 # ==============================================================================
-# 4. AGREGACIÓN DEL PORTAFOLIO: CORRELACIÓN IMPLÍCITA Y COVARIANZA
+# BLOQUE 8: AGREGACION DEL PORTAFOLIO
+# Matriz de correlacion (EWMA, muestral o filtrada por Random Matrix Theory),
+# covarianza implicita y atribucion de riesgo por descomposicion de Euler.
 # ==============================================================================
 class ImpliedCorrelationEstimator:
-    """Estima la matriz de correlación usada en la covarianza implícita.
-
-    Métodos:
-        * ``'sample'``: correlación de Pearson de los retornos logarítmicos.
-        * ``'ewma'``: covarianza con ponderación exponencial (RiskMetrics,
-          ``lambda = 0.94``), que pondera el régimen reciente y es el análogo
-          histórico más cercano al horizonte de 30 días de las opciones.
-        * ``'rmt'``: filtrado espectral tipo Random Matrix Theory
-          (Marchenko-Pastur). Los autovalores dentro del "bulk" de ruido se
-          sustituyen por su media preservando la traza, conservando el modo de
-          mercado y los factores significativos. Se proyecta después a la matriz
-          definida positiva más cercana.
-    """
-
     def __init__(self, lam: float = 0.94, eig_floor: float = 1e-8, verbose: bool = True) -> None:
-        """
-        Args:
-            lam: Factor de decaimiento EWMA.
-            eig_floor: Suelo de autovalores en la proyección definida positiva.
-            verbose: Imprime diagnóstico del filtrado.
-        """
         self.lam = lam
         self.eig_floor = eig_floor
         self.verbose = verbose
@@ -1141,21 +835,18 @@ class ImpliedCorrelationEstimator:
     # -- helpers ---------------------------------------------------------------
     @staticmethod
     def _cov_to_corr(cov: np.ndarray) -> np.ndarray:
-        """Convierte una matriz de covarianza en correlación acotada en [-1, 1]."""
         d = np.sqrt(np.clip(np.diag(cov), 1e-16, None))
         corr = cov / np.outer(d, d)
         np.fill_diagonal(corr, 1.0)
         return np.clip(corr, -1.0, 1.0)
 
     def _nearest_pd_corr(self, corr: np.ndarray) -> np.ndarray:
-        """Proyección espectral a la matriz de correlación definida positiva más cercana."""
         corr = 0.5 * (corr + corr.T)
         vals, vecs = np.linalg.eigh(corr)
         vals = np.clip(vals, self.eig_floor, None)
         return self._cov_to_corr(vecs @ np.diag(vals) @ vecs.T)
 
     def _ewma_cov(self, rets: np.ndarray) -> np.ndarray:
-        """Covarianza EWMA con pesos normalizados."""
         t = rets.shape[0]
         w = (1.0 - self.lam) * self.lam ** np.arange(t - 1, -1, -1)
         w /= w.sum()
@@ -1163,7 +854,6 @@ class ImpliedCorrelationEstimator:
         return (x * w[:, None]).T @ x
 
     def _rmt_filter(self, corr: np.ndarray, t: int) -> np.ndarray:
-        """Limpieza de autovalores por Marchenko-Pastur (clipping del bulk de ruido)."""
         n = corr.shape[0]
         if t <= n + 1:
             warnings.warn(
@@ -1190,18 +880,6 @@ class ImpliedCorrelationEstimator:
 
     # -- API -------------------------------------------------------------------
     def estimate(self, prices: pd.DataFrame, method: CorrMethod = "ewma") -> np.ndarray:
-        """Calcula la matriz de correlación del portafolio.
-
-        Args:
-            prices: DataFrame de precios de cierre (columnas = tickers).
-            method: ``'sample'``, ``'ewma'`` o ``'rmt'``.
-
-        Returns:
-            Matriz de correlación ``(N, N)`` definida positiva.
-
-        Raises:
-            ValueError: Si el método es desconocido.
-        """
         n = prices.shape[1]
         if n == 1:
             return np.ones((1, 1))
@@ -1226,29 +904,12 @@ class ImpliedCorrelationEstimator:
 
 
 class PortfolioVIX:
-    """Agrega las volatilidades implícitas individuales a nivel de portafolio."""
-
     def __init__(self, verbose: bool = True) -> None:
-        """
-        Args:
-            verbose: Reservado para diagnóstico adicional.
-        """
         self.verbose = verbose
 
     def aggregate(
         self, tickers: Sequence[str], w: np.ndarray, sig30: np.ndarray, corr: np.ndarray
     ) -> Tuple[float, np.ndarray, pd.DataFrame, Dict[str, float]]:
-        """Construye la covarianza implícita y la atribución de riesgo.
-
-        Args:
-            tickers: Nombres de los activos.
-            w: Vector de pesos (se normaliza a suma 1 si es necesario).
-            sig30: Volatilidades implícitas a 30 días (anualizadas, en decimal).
-            corr: Matriz de correlación.
-
-        Returns:
-            Tupla ``(vix_port, cov, breakdown_df, metrics)``.
-        """
         w = np.asarray(w, dtype=float)
         if not np.isclose(w.sum(), 1.0):
             warnings.warn(f"Los pesos suman {w.sum():.4f}; se normalizan a 1.", RuntimeWarning)
@@ -1295,18 +956,13 @@ class PortfolioVIX:
 
 
 # ==============================================================================
-# CARGA DE DATOS: YFINANCE Y GENERADOR SINTÉTICO
+# BLOQUE 9: CARGA DE DATOS
+# Fuente principal Polygon.io: vencimientos con criterio CBOE, cadenas por
+# snapshot y dividendos discretos con modelo escrowed (se descuenta del spot
+# el valor presente de los pagos previos al vencimiento en vez de usar un
+# yield continuo). Respaldos en cascada: polygon -> yahoo -> sintetico.
 # ==============================================================================
 def year_fraction(expiry: pd.Timestamp, now: Optional[pd.Timestamp] = None) -> float:
-    """Fracción de año (base 365, resolución de minutos) hasta el cierre del vencimiento.
-
-    Args:
-        expiry: Fecha de vencimiento; se asume liquidación a las 16:00 ET.
-        now: Momento de valoración; por defecto la hora UTC actual.
-
-    Returns:
-        Tiempo a vencimiento en años, con un suelo de un minuto.
-    """
     now = now if now is not None else pd.Timestamp.now(tz="UTC")
     if now.tzinfo is None:
         now = now.tz_localize("UTC")
@@ -1317,17 +973,6 @@ def year_fraction(expiry: pd.Timestamp, now: Optional[pd.Timestamp] = None) -> f
 
 
 def select_cboe_expiries(expiries: Sequence[str], min_days: float = OPT_MIN_DTE) -> List[str]:
-    """Selección de vencimientos al estilo CBOE: near-term y next-term.
-
-    Args:
-        expiries: Fechas de vencimiento disponibles (``YYYY-MM-DD``).
-        min_days: Días mínimos a vencimiento admitidos, para evitar el ruido de
-            microestructura de los vencimientos muy cortos.
-
-    Returns:
-        Lista con el near-term (<= 30 días) y el next-term (> 30 días); si no
-        existe esa pareja, los dos vencimientos válidos más cercanos.
-    """
     now = pd.Timestamp.now(tz="UTC")
     cand = [(e, year_fraction(pd.Timestamp(e), now) * 365.0) for e in sorted(set(expiries))]
     cand = [(e, d) for e, d in cand if d >= min_days]
@@ -1341,7 +986,6 @@ def select_cboe_expiries(expiries: Sequence[str], min_days: float = OPT_MIN_DTE)
 
 
 def clamp_iv(iv: Optional[float]) -> float:
-    """Filtra volatilidades implícitas publicadas fuera del rango razonable."""
     if iv is None:
         return float("nan")
     try:
@@ -1361,28 +1005,6 @@ def escrowed_inputs(
     r: float,
     now: Optional[pd.Timestamp] = None,
 ) -> Tuple[float, float]:
-    """Convierte un calendario de dividendos discretos en spot "escrowed".
-
-    El modelo escrowed sustituye el dividend yield continuo por el spot neto del
-    valor presente de los dividendos que se pagan antes del vencimiento:
-    ``S_esc = S - sum_i D_i e^{-r t_i}``, con ``q`` efectivo igual a cero. Es el
-    tratamiento correcto para acciones individuales, donde el dividendo es un
-    pago puntual y no un flujo continuo, y evita el sesgo en las cotas de
-    no-arbitraje y en la inversión de la volatilidad implícita.
-
-    Args:
-        spot: Precio spot observado.
-        q: Dividend yield continuo (convención de respaldo).
-        dividends: Dividendos futuros ``(fecha ex, importe)``.
-        T: Tiempo a vencimiento en años.
-        r: Tasa libre de riesgo continua.
-        now: Momento de valoración; por defecto la hora UTC actual.
-
-    Returns:
-        Tupla ``(S_efectivo, q_efectivo)``. Sin calendario de dividendos, o si
-        :data:`USE_ESCROWED_DIVIDENDS` está desactivado, devuelve ``(spot, q)``
-        sin tocar.
-    """
     if not USE_ESCROWED_DIVIDENDS or not dividends:
         return spot, q
 
@@ -1402,34 +1024,6 @@ def escrowed_inputs(
 
 
 class PolygonMarketLoader:
-    """Carga cadenas de opciones desde Polygon.io (fuente de datos por defecto).
-
-    El plan de opciones de Polygon no publica ``bid``/``ask`` por contrato, pero
-    sí la volatilidad implícita, las griegas, el interés abierto y el agregado
-    diario. El flujo aplicado es por tanto:
-
-        1. ``/v3/reference/options/contracts`` -> vencimientos disponibles, de
-           donde se eligen near-term y next-term con el criterio CBOE.
-        2. ``/v3/snapshot/options/{ticker}`` -> cadena completa de cada
-           vencimiento dentro de la ventana de strikes configurada.
-        3. La IV publicada se convierte en precio **americano**
-           (Bjerksund-Stensland) y se le asocia un bid/ask sintético cuyo
-           semi-spread depende de la liquidez real del contrato (interés
-           abierto y volumen). Cuando no hay IV publicada se recurre al cierre
-           del día como precio observado.
-
-    De este modo el resto del motor (limpieza, filtros de no-arbitraje,
-    de-americanización, sonrisa y varianza model-free) trabaja exactamente
-    igual que con cotizaciones bid/ask reales, y los contratos ilíquidos quedan
-    penalizados por el filtro de spread en vez de contaminar la sonrisa.
-
-    Note:
-        Los endpoints de opciones no están limitados por tasa en el plan
-        vigente, pero los de acciones sí (5 peticiones/minuto). El histórico de
-        precios se toma de yfinance y sólo se recurre a los agregados de
-        Polygon —con throttling— si yfinance falla.
-    """
-
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -1440,19 +1034,6 @@ class PolygonMarketLoader:
         strike_range_pct: float = OPT_STRIKE_RANGE_PCT,
         verbose: bool = True,
     ) -> None:
-        """
-        Args:
-            api_key: Clave de Polygon; por defecto ``POLYGON_API_KEY`` del entorno.
-            r: Tasa libre de riesgo continua (para convertir IV en precio).
-            engine: Motor de valoración americana.
-            min_days: Días mínimos a vencimiento.
-            max_days: Horizonte máximo al listar vencimientos.
-            strike_range_pct: Ventana de strikes alrededor del spot.
-            verbose: Imprime lo descargado.
-
-        Raises:
-            RuntimeError: Si no hay clave de API disponible.
-        """
         self.api_key = api_key or POLYGON_API_KEY
         if not self.api_key:
             raise RuntimeError(
@@ -1469,11 +1050,6 @@ class PolygonMarketLoader:
 
     # -- transporte ------------------------------------------------------------
     def _get(self, url: str, params: Optional[Dict[str, object]] = None) -> Dict[str, object]:
-        """GET con reintentos ante el límite de peticiones (HTTP 429).
-
-        Raises:
-            RuntimeError: Si el límite persiste tras los reintentos.
-        """
         for attempt in range(4):
             resp = self.session.get(url, params=params, timeout=30)
             if resp.status_code == 429:
@@ -1489,7 +1065,6 @@ class PolygonMarketLoader:
     def _paginate(
         self, url: str, params: Dict[str, object], max_pages: int = POLYGON_MAX_PAGES
     ) -> List[Dict[str, object]]:
-        """Recorre la paginación por cursor de Polygon y acumula ``results``."""
         out: List[Dict[str, object]] = []
         next_url: Optional[str] = url
         page = 0
@@ -1502,7 +1077,6 @@ class PolygonMarketLoader:
         return out
 
     def _throttle_stocks(self) -> None:
-        """Espacia las llamadas a endpoints de acciones (5/min en el tier gratuito)."""
         elapsed = time.time() - self._last_stock_call
         if self._last_stock_call and elapsed < STOCKS_THROTTLE_SECONDS:
             time.sleep(STOCKS_THROTTLE_SECONDS - elapsed)
@@ -1511,7 +1085,6 @@ class PolygonMarketLoader:
     # -- datos del subyacente --------------------------------------------------
     @staticmethod
     def _lookback_days(lookback: str) -> int:
-        """Convierte etiquetas tipo ``'2y'`` / ``'18mo'`` / ``'250d'`` en días."""
         s = str(lookback).strip().lower()
         try:
             if s.endswith("mo"):
@@ -1525,7 +1098,6 @@ class PolygonMarketLoader:
             return 730
 
     def _history_polygon(self, ticker: str, lookback: str) -> pd.Series:
-        """Cierres diarios ajustados desde los agregados de Polygon (con throttling)."""
         end = date.today()
         start = end - timedelta(days=self._lookback_days(lookback) + 10)
         self._throttle_stocks()
@@ -1541,7 +1113,6 @@ class PolygonMarketLoader:
         return pd.Series([float(r["c"]) for r in rows], index=idx, name=ticker)
 
     def _history(self, ticker: str, lookback: str) -> pd.Series:
-        """Histórico de cierres: yfinance como fuente primaria, Polygon como respaldo."""
         if _HAS_YF:
             try:
                 hist = yf.Ticker(ticker).history(period=lookback, auto_adjust=True)["Close"]
@@ -1560,20 +1131,6 @@ class PolygonMarketLoader:
     def _dividend_schedule(
         self, ticker: str, spot: float
     ) -> Tuple[float, List[Tuple[pd.Timestamp, float]]]:
-        """Dividendos del subyacente a partir de ``/v3/reference/dividends``.
-
-        Args:
-            ticker: Símbolo del subyacente.
-            spot: Spot, para anualizar el yield de respaldo.
-
-        Returns:
-            Tupla ``(q_continuo, calendario)``. ``q_continuo`` es el yield de los
-            últimos 12 meses (respaldo cuando no hay calendario utilizable) y
-            ``calendario`` son los pagos ``(fecha ex, importe)`` que caen dentro
-            del horizonte de vencimientos: los ya declarados por la compañía y,
-            si no los hay, la proyección del siguiente según la periodicidad
-            histórica.
-        """
         try:
             payload = self._get(
                 f"{POLYGON_BASE_URL}/v3/reference/dividends",
@@ -1636,7 +1193,6 @@ class PolygonMarketLoader:
 
     # -- cadena de opciones ----------------------------------------------------
     def _expirations(self, ticker: str) -> List[str]:
-        """Vencimientos disponibles dentro de la ventana ``[min_days, max_days]``."""
         today = date.today()
         params = {
             "apiKey": self.api_key,
@@ -1655,12 +1211,6 @@ class PolygonMarketLoader:
         return sorted({str(c.get("expiration_date")) for c in contracts if c.get("expiration_date")})
 
     def _chain(self, ticker: str, expiration: str, spot: float, T: float, q: float) -> pd.DataFrame:
-        """Cadena de un vencimiento con bid/ask sintético derivado de la IV publicada.
-
-        ``spot`` y ``q`` deben venir ya en la convención de dividendos que usará
-        el resto del motor (escrowed o yield continuo), para que la IV publicada
-        se convierta en precio y se vuelva a invertir sin desfase.
-        """
         params = {
             "apiKey": self.api_key,
             "limit": 250,
@@ -1752,18 +1302,6 @@ class PolygonMarketLoader:
     def load(
         self, tickers: Sequence[str], lookback: str = HISTORY_LOOKBACK
     ) -> Tuple[List[AssetMarketData], pd.DataFrame]:
-        """Descarga opciones (Polygon) e histórico de precios del portafolio.
-
-        Args:
-            tickers: Símbolos del portafolio.
-            lookback: Ventana de histórico para las correlaciones.
-
-        Returns:
-            Tupla ``(lista de AssetMarketData, DataFrame de cierres)``.
-
-        Raises:
-            RuntimeError: Si ningún activo devuelve una cadena utilizable.
-        """
         assets: List[AssetMarketData] = []
         closes: Dict[str, pd.Series] = {}
         now = pd.Timestamp.now(tz="UTC")
@@ -1827,37 +1365,16 @@ class PolygonMarketLoader:
 
 
 class YahooMarketLoader:
-    """Carga cadenas de opciones e histórico de precios desde Yahoo Finance."""
-
     def __init__(self, min_days: float = 7.0, verbose: bool = True) -> None:
-        """
-        Args:
-            min_days: Días mínimos a vencimiento admitidos (evita el efecto de
-                microestructura de los vencimientos muy cortos).
-            verbose: Imprime lo descargado.
-        """
         self.min_days = min_days
         self.verbose = verbose
 
     def _pick_expiries(self, expiries: Sequence[str]) -> List[str]:
-        """Selección estilo CBOE: near-term <= 30 días y next-term > 30 días."""
         return select_cboe_expiries(expiries, self.min_days)
 
     def load(
         self, tickers: Sequence[str], lookback: str = "2y"
     ) -> Tuple[List[AssetMarketData], pd.DataFrame]:
-        """Descarga datos de mercado reales.
-
-        Args:
-            tickers: Lista de símbolos.
-            lookback: Ventana de histórico para las correlaciones.
-
-        Returns:
-            Tupla ``(lista de AssetMarketData, DataFrame de cierres)``.
-
-        Raises:
-            RuntimeError: Si yfinance no está instalado o no hay histórico.
-        """
         if not _HAS_YF:
             raise RuntimeError("yfinance no está instalado")
         assets: List[AssetMarketData] = []
@@ -1905,22 +1422,7 @@ class YahooMarketLoader:
 
 
 class SyntheticMarketGenerator:
-    """Genera cadenas de opciones americanas realistas sin conexión a red.
-
-    El generador construye una superficie SVI "verdadera", la convierte en
-    precios americanos con Bjerksund-Stensland (añadiendo por tanto la prima de
-    ejercicio anticipado), aplica un bid-ask realista y degrada la cadena
-    (huecos de strikes y bids en cero en las alas) para reproducir la iliquidez
-    típica de las opciones sobre acciones individuales.
-    """
-
     def __init__(self, r: float = 0.045, seed: int = 7, verbose: bool = True) -> None:
-        """
-        Args:
-            r: Tasa libre de riesgo continua.
-            seed: Semilla del generador aleatorio (reproducibilidad).
-            verbose: Imprime los parámetros verdaderos de cada activo.
-        """
         self.r = r
         self.rng = np.random.default_rng(seed)
         self.verbose = verbose
@@ -1928,7 +1430,6 @@ class SyntheticMarketGenerator:
     def _svi_iv(
         self, k: np.ndarray, T: float, base: float, skew: float, curv: float
     ) -> np.ndarray:
-        """Volatilidad implícita verdadera a partir de una SVI raw parametrizada."""
         a = base**2 * T * 0.6
         b = curv * T
         rho, m, s = skew, 0.02, 0.14
@@ -1945,20 +1446,6 @@ class SyntheticMarketGenerator:
         n_hist: int = 750,
         drop_frac: float = 0.28,
     ) -> Tuple[List[AssetMarketData], pd.DataFrame]:
-        """Crea el universo sintético completo (opciones + histórico correlacionado).
-
-        Args:
-            tickers: Nombres de los activos.
-            spots: Spots iniciales; por defecto aleatorios en [80, 400].
-            base_vols: Nivel ATM de volatilidad por activo.
-            divs: Dividend yields continuos.
-            days: Días a vencimiento de los dos cortes (near, next).
-            n_hist: Número de observaciones históricas simuladas.
-            drop_frac: Fracción de cotizaciones eliminadas para simular huecos.
-
-        Returns:
-            Tupla ``(lista de AssetMarketData, DataFrame de cierres)``.
-        """
         n = len(tickers)
         spots = list(spots) if spots is not None else list(self.rng.uniform(80, 400, n))
         base_vols = (
@@ -2023,21 +1510,11 @@ class SyntheticMarketGenerator:
 
 
 # ==============================================================================
-# 5. SALIDAS Y GRÁFICOS
+# BLOQUE 10: INFORME INTERACTIVO
+# Panel Plotly con las sonrisas por activo, la ponderacion dK*Q(K)/K^2, la
+# matriz de correlacion y la atribucion de riesgo. Se guarda como HTML.
 # ==============================================================================
 class ReportPlotter:
-    """Informe interactivo (Plotly): sonrisas, ponderación 1/K^2 y atribución.
-
-    Genera un único panel con:
-        * la sonrisa de-americanizada de cada activo (ajuste denso + puntos de
-          mercado) para el near-term y el next-term,
-        * la distribución de la ponderación ``dK Q(K) / K^2`` del strip CBOE,
-        * la matriz de correlación implícita,
-        * la atribución de riesgo (Euler) y su reparto porcentual.
-
-    La salida es un único HTML interactivo (Plotly).
-    """
-
     NEAR_COLOR = "#3987e5"
     NEXT_COLOR = "#e6893c"
 
@@ -2048,7 +1525,6 @@ class ReportPlotter:
         metrics: Dict[str, float],
         corr: np.ndarray,
     ) -> "go.Figure":
-        """Construye la figura Plotly del informe."""
         tickers = list(fits_by_asset.keys())
         n = len(tickers)
         rows_smiles = max((n + 2) // 3, 1)
@@ -2267,19 +1743,6 @@ class ReportPlotter:
         html_file: str = OUTPUT_HTML,
         show: bool = False,
     ) -> Optional[str]:
-        """Construye, guarda y (opcionalmente) muestra el informe.
-
-        Args:
-            fits_by_asset: Ajustes de sonrisa por ticker.
-            breakdown: DataFrame de atribución de riesgo.
-            metrics: Métricas agregadas del portafolio.
-            corr: Matriz de correlación empleada.
-            html_file: Ruta del informe interactivo.
-            show: Abre el informe interactivo al terminar.
-
-        Returns:
-            Ruta del HTML guardado, o ``None`` si Plotly no está disponible.
-        """
         if not _HAS_PLOTLY:
             warnings.warn(
                 "plotly no está instalado: se omite el informe gráfico "
@@ -2302,32 +1765,12 @@ class ReportPlotter:
 
 
 # ==============================================================================
-# ORQUESTADOR PRINCIPAL
+# BLOQUE 11: ORQUESTADOR
+# Configuracion efectiva del calculo y encadenado de los bloques 5 a 10,
+# excluyendo los activos que no se puedan valorar y renormalizando pesos.
 # ==============================================================================
 @dataclass
 class VIXConfig:
-    """Configuración global del cálculo.
-
-    Los valores por defecto salen del bloque editable de la cabecera del
-    archivo (:data:`PORTFOLIO_HOLDINGS` y compañía); la CLI sólo los sobrescribe
-    cuando se pasa el argumento correspondiente.
-
-    Attributes:
-        tickers: Símbolos del portafolio.
-        weights: Pesos; ``None`` equivale a equiponderado.
-        r: Tasa libre de riesgo continua.
-        source: Fuente de datos de opciones (``polygon``, ``yahoo``, ``synthetic``).
-        vol_method: Método de construcción de la sonrisa.
-        corr_method: Método de estimación de la correlación.
-        american_engine: Motor de valoración americana.
-        n_grid: Tamaño de la grilla densa de strikes.
-        ewma_lambda: Factor de decaimiento EWMA.
-        lookback: Ventana histórica para la correlación.
-        verbose: Nivel de detalle en consola.
-        html_file: Ruta del informe interactivo.
-        show_plot: Abre el informe interactivo al terminar.
-    """
-
     tickers: List[str] = field(default_factory=portfolio_tickers)
     weights: Optional[List[float]] = field(default_factory=portfolio_weights)
     r: float = RISK_FREE_RATE
@@ -2344,13 +1787,7 @@ class VIXConfig:
 
 
 class PortfolioVIXCalculator:
-    """Punto de entrada de alto nivel que encadena los cinco módulos."""
-
     def __init__(self, config: VIXConfig) -> None:
-        """
-        Args:
-            config: Configuración del cálculo.
-        """
         self.cfg = config
         self.cleaner = OptionChainCleaner(verbose=config.verbose)
         self.deamer = DeAmericanizer(engine=config.american_engine, verbose=config.verbose)
@@ -2366,10 +1803,6 @@ class PortfolioVIXCalculator:
 
     # -- datos -----------------------------------------------------------------
     def _load(self) -> Tuple[List[AssetMarketData], pd.DataFrame]:
-        """Carga los datos según la fuente configurada, con degradación en cascada.
-
-        Orden de respaldo: ``polygon`` -> ``yahoo`` -> ``synthetic``.
-        """
         src = self.cfg.source
 
         if src == "polygon":
@@ -2417,15 +1850,6 @@ class PortfolioVIXCalculator:
 
     # -- ejecución -------------------------------------------------------------
     def run(self) -> Dict[str, object]:
-        """Ejecuta el pipeline completo.
-
-        Returns:
-            Diccionario con ``vix``, ``breakdown``, ``metrics``, ``covariance``,
-            ``correlation``, ``fits``, ``figure``, ``plot`` y ``source``.
-
-        Raises:
-            RuntimeError: Si ningún activo puede ser valorado.
-        """
         assets, prices = self._load()
 
         sig30: List[float] = []
@@ -2494,7 +1918,6 @@ class PortfolioVIXCalculator:
         tickers: Sequence[str],
         plot: Optional[str],
     ) -> None:
-        """Imprime el informe final en consola."""
         with pd.option_context("display.float_format", lambda v: f"{v:,.4f}"):
             print("\n" + "=" * 80)
             print(" RESULTADO — VIX DE PORTAFOLIO (30 días, model-free)")
@@ -2513,14 +1936,11 @@ class PortfolioVIXCalculator:
 
 
 # ==============================================================================
-# CLI
+# BLOQUE 12: CLI
+# Argumentos de linea de comandos. Sin argumentos se usa el portafolio y las
+# rutas declaradas en el BLOQUE 1.
 # ==============================================================================
 def _parse_args() -> VIXConfig:
-    """Parsea los argumentos de línea de comandos y devuelve la configuración.
-
-    Sin argumentos, el portafolio y las salidas son los declarados en la
-    cabecera editable del archivo.
-    """
     p = argparse.ArgumentParser(description="VIX de portafolio model-free (CBOE extendido)")
     p.add_argument("--tickers", nargs="+", default=None, help="sobrescribe PORTFOLIO_HOLDINGS")
     p.add_argument("--weights", nargs="+", type=float, default=None)
