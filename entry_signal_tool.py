@@ -41,9 +41,9 @@ PESOS = {
 UMBRAL_ALTO = 75
 UMBRAL_MEDIO = 40
 
-# Dias habiles consecutivos con score por debajo de UMBRAL_MEDIO antes de forzar
-# una decision definitiva (ENTRAR/ESPERAR) en vez de seguir goteando la entrada.
-UMBRAL_DIAS_DECISION_FORZADA = 5
+# Duracion del ciclo de entrada en dias habiles. En el ultimo dia se decide en
+# firme la fraccion no invertida: comprar el 100% restante o consolidarla en cash.
+DIAS_CICLO = 5
 
 HORIZON_DIAS_OBJETIVO = 30
 VENTANA_BUSQUEDA_VENCIMIENTO_DIAS = 20
@@ -59,23 +59,53 @@ def cargar_historial():
         return pd.read_csv(HIST_PATH, parse_dates=["fecha"])
     return pd.DataFrame()
 
-# ---------------- ESTADO DE ENTRADAS (POSICIONES YA TOMADAS) ----------------
+# ---------------- ESTADO DEL CICLO Y DE LAS ENTRADAS ----------------
+
+def _activo_vacio():
+    return {"pct_ya_invertido": 0.0, "pct_cash_consolidado": 0.0, "decision_final": None}
+
+def _estado_vacio():
+    return {
+        "ciclo": 1,
+        "dia_ciclo": 1,
+        "ciclo_cerrado": False,
+        "ultima_actualizacion": None,
+        "activos": {ticker: _activo_vacio() for ticker in TICKERS},
+    }
+
+# El dia del ciclo vive una sola vez a nivel global (antes cada activo llevaba su
+# propio contador dias_score_bajo). Los estados en formato antiguo se migran aqui.
+def normalizar_estado(estado):
+    if not estado:
+        return _estado_vacio()
+    if "activos" not in estado:
+        antiguo = estado
+        estado = _estado_vacio()
+        for ticker, info in antiguo.items():
+            if isinstance(info, dict) and "pct_ya_invertido" in info:
+                estado["activos"].setdefault(ticker, _activo_vacio())
+                estado["activos"][ticker]["pct_ya_invertido"] = float(info["pct_ya_invertido"])
+    for ticker in TICKERS:
+        estado["activos"].setdefault(ticker, _activo_vacio())
+    return estado
 
 def cargar_estado():
-    if os.path.exists(STATE_PATH):
-        with open(STATE_PATH, "r") as f:
-            return json.load(f)
-    return None
+    if not os.path.exists(STATE_PATH):
+        return _estado_vacio()
+    with open(STATE_PATH, "r") as f:
+        return normalizar_estado(json.load(f))
 
 def guardar_estado(estado):
     with open(STATE_PATH, "w") as f:
         json.dump(estado, f, indent=2)
 
-def pedir_pct(mensaje):
+# ---------------- FLUJO INTERACTIVO DE INICIO ----------------
+
+def pedir_pct(mensaje, default=0.0):
     while True:
         crudo = input(mensaje).strip().replace("%", "")
         if crudo == "":
-            return 0.0
+            return default
         try:
             valor = float(crudo)
         except ValueError:
@@ -86,43 +116,79 @@ def pedir_pct(mensaje):
             continue
         return valor / 100
 
-def inicializar_estado():
-    hoy = datetime.now(timezone.utc).date().isoformat()
-    respuesta = input("\n¿Ya tienes posiciones abiertas en este portafolio? [s/n]: ").strip().lower()
-    estado = {}
-    if respuesta.startswith("s"):
-        print("\nIndica el % ya invertido en cada activo, respecto a SU peso objetivo (0-100). Enter = 0%.\n")
-        for ticker in TICKERS:
-            peso = PESOS_OBJETIVO.get(ticker, np.nan)
-            pct = pedir_pct(f"  {ticker} (peso objetivo {peso*100:.2f}% del portafolio): ")
-            estado[ticker] = {"pct_ya_invertido": pct, "dias_score_bajo": 0, "ultima_actualizacion": hoy}
-    else:
-        print("\nEntendido: dia 1 del portafolio, se parte de 0% invertido en todos los activos.\n")
-        for ticker in TICKERS:
-            estado[ticker] = {"pct_ya_invertido": 0.0, "dias_score_bajo": 0, "ultima_actualizacion": hoy}
-    return estado
-
-def permitir_correccion_manual(estado):
-    respuesta = input(
-        "\n¿Quieres corregir manualmente el % ya invertido de algun activo antes de continuar? [s/n]: "
-    ).strip().lower()
-    if not respuesta.startswith("s"):
-        return estado
-    print("Escribe el ticker a corregir (Enter vacio para terminar).")
+def pedir_dia_ciclo(sugerido):
     while True:
-        ticker = input("  Ticker: ").strip().upper()
-        if ticker == "":
-            break
-        if ticker not in estado:
-            print(f"  '{ticker}' no esta en el portafolio, se ignora.")
+        crudo = input(
+            f"\n¿En que dia del ciclo de {DIAS_CICLO} dias habiles se encuentra la estrategia? "
+            f"[1-{DIAS_CICLO}] (Enter = {sugerido}): "
+        ).strip()
+        if crudo == "":
+            return sugerido
+        try:
+            dia = int(crudo)
+        except ValueError:
+            print(f"  Ingresa un entero entre 1 y {DIAS_CICLO}.")
             continue
-        estado[ticker]["pct_ya_invertido"] = pedir_pct(f"  Nuevo % ya invertido en {ticker} (0-100): ")
+        if not 1 <= dia <= DIAS_CICLO:
+            print(f"  El dia debe estar entre 1 y {DIAS_CICLO}.")
+            continue
+        return dia
+
+def pedir_pesos_actuales(estado):
+    print(
+        "\n% YA INVERTIDO en cada activo respecto a SU peso objetivo (0-100)."
+        "\nEnter = mantener el valor guardado que se muestra entre parentesis.\n"
+    )
+    for ticker in TICKERS:
+        activo = estado["activos"][ticker]
+        peso = PESOS_OBJETIVO.get(ticker, np.nan)
+        actual = activo["pct_ya_invertido"]
+        activo["pct_ya_invertido"] = pedir_pct(
+            f"  {ticker} (peso objetivo {peso*100:.2f}% del portafolio | guardado {actual*100:.0f}%): ",
+            default=actual,
+        )
     return estado
 
-def evaluar_decision_forzada(ticker, hist_df):
-    hist_ticker = hist_df[hist_df["ticker"] == ticker].sort_values("fecha").tail(5)
+def flujo_inicio(estado):
+    hoy = datetime.now(timezone.utc).date().isoformat()
+
+    if estado["ultima_actualizacion"] is None or estado["ciclo_cerrado"]:
+        sugerido = 1
+    else:
+        sugerido = min(estado["dia_ciclo"] + 1, DIAS_CICLO)
+
+    dia = pedir_dia_ciclo(sugerido)
+
+    # Retroceder en el numero de dia significa que arranco un ciclo nuevo:
+    # se limpian las decisiones de cierre y el cash consolidado del anterior.
+    if estado["ultima_actualizacion"] is not None and dia < estado["dia_ciclo"]:
+        estado["ciclo"] += 1
+        estado["ciclo_cerrado"] = False
+        for activo in estado["activos"].values():
+            activo["pct_cash_consolidado"] = 0.0
+            activo["decision_final"] = None
+        print(f"\nArranca el ciclo {estado['ciclo']}: se limpian las decisiones del ciclo anterior.")
+
+    estado["dia_ciclo"] = dia
+    estado["ultima_actualizacion"] = hoy
+
+    pedir_pesos_actuales(estado)
+
+    if dia >= DIAS_CICLO:
+        print(
+            f"\nDIA {DIAS_CICLO} (ultimo del ciclo): hoy se decide en firme la fraccion no invertida."
+            "\nSegun el flujo de opciones acumulado se compra el 100% restante o se consolida en cash.\n"
+        )
+    else:
+        print(f"\nDia {dia} de {DIAS_CICLO}: entrada por goteo segun el score de conviccion de hoy.\n")
+    return estado
+
+# ---------------- DECISION DE CIERRE (DIA 5) ----------------
+
+def evaluar_flujo_opciones(ticker, hist_df):
+    hist_ticker = hist_df[hist_df["ticker"] == ticker].sort_values("fecha").tail(DIAS_CICLO)
     if len(hist_ticker) < 3:
-        return "ESPERAR", "historial insuficiente para una decision forzada confiable"
+        return "CASH", "historial insuficiente para forzar la compra del restante"
 
     señales_favorables = 0
     señales_totales = 0
@@ -142,14 +208,14 @@ def evaluar_decision_forzada(ticker, hist_df):
         señales_totales += 1
         if dist_zg.iloc[-1] < dist_zg.iloc[0]:
             señales_favorables += 1
-            detalles.append("precio acercandose al zero-gamma (mayor estabilidad esperada)")
+            detalles.append("acortamiento a zero-gamma (mayor estabilidad esperada)")
         else:
             detalles.append("precio alejandose del zero-gamma")
 
     if señales_totales == 0:
-        return "ESPERAR", "sin señales de flujo de opciones suficientes"
+        return "CASH", "sin señales de flujo de opciones suficientes"
 
-    decision = "ENTRAR" if señales_favorables / señales_totales >= 0.5 else "ESPERAR"
+    decision = "ENTRAR" if señales_favorables / señales_totales >= 0.5 else "CASH"
     return decision, "; ".join(detalles)
 
 # ---------------- FUNCIONES DE EXTRACCION ----------------
@@ -439,64 +505,66 @@ def calcular_indicadores_ticker(ticker, hist_df):
 
 # ---------------- VISUALIZACION ----------------
 
-def _reco_corta(texto):
-    if texto.startswith("DECISION FORZADA -> ENTRAR"):
-        return "<b>FORZADO: ENTRAR</b>"
-    if texto.startswith("DECISION FORZADA -> ESPERAR"):
-        return "<b>FORZADO: ESPERAR</b>"
-    if texto.startswith("MANTENER"):
-        return "MANTENER"
-    return texto
+COLORES_ACCION = {
+    "CIERRE: ENTRAR": "#0ca30c",
+    "CIERRE: CASH": "#d03b3b",
+    "COMPLETO": "#2a78d6",
+}
+COLOR_TEXTO_NORMAL = "#52514e"
 
 def graficar_resumen(resumen):
     if resumen.empty:
         return None
 
     df = resumen.sort_values("score_conviccion", ascending=True).reset_index(drop=True)
-    despues = (df["pct_ya_invertido_previo"] + df["delta_sugerido_hoy_pct"]).clip(upper=100)
-    pendiente = 100 - despues
+    dia = int(df["dia_ciclo"].iloc[0])
+    ciclo = int(df["ciclo"].iloc[0])
+    es_ultimo_dia = dia >= DIAS_CICLO
 
-    color_invertido = "#2a78d6"
-    color_hoy = "#1baf7a"
-    color_pendiente = "#e1e0d9"
-    color_forzado_entrar = "#0ca30c"
-    color_forzado_esperar = "#d03b3b"
-    color_texto_normal = "#52514e"
+    cash = df["cash_definitivo_pct"]
+    pendiente = (100 - df["pct_invertido_final_pct"] - cash).clip(lower=0)
 
     fig = go.Figure()
     fig.add_trace(go.Bar(
         y=df["ticker"], x=df["pct_ya_invertido_previo"], name="Ya invertido", orientation="h",
-        marker_color=color_invertido,
-        customdata=df["recomendacion"],
+        marker_color="#2a78d6",
         hovertemplate="<b>%{y}</b><br>Ya invertido: %{x:.1f}%<extra></extra>",
     ))
     fig.add_trace(go.Bar(
         y=df["ticker"], x=df["delta_sugerido_hoy_pct"], name="Sugerido hoy", orientation="h",
-        marker_color=color_hoy,
+        marker_color="#1baf7a",
         customdata=df["recomendacion"],
         hovertemplate="<b>%{y}</b><br>Sugerido hoy: %{x:.1f}%<br>%{customdata}<extra></extra>",
     ))
     fig.add_trace(go.Bar(
-        y=df["ticker"], x=pendiente, name="Pendiente", orientation="h",
-        marker_color=color_pendiente,
+        y=df["ticker"], x=pendiente, name="Pendiente (goteo)", orientation="h",
+        marker_color="#e1e0d9",
         customdata=df["recomendacion"],
         hovertemplate="<b>%{y}</b><br>Pendiente: %{x:.1f}%<br>%{customdata}<extra></extra>",
+    ))
+    fig.add_trace(go.Bar(
+        y=df["ticker"], x=cash, name=f"Cash definitivo (cierre dia {DIAS_CICLO})", orientation="h",
+        marker_color="#f0b7b7",
+        marker_line=dict(color="#d03b3b", width=1),
+        customdata=df["recomendacion"],
+        hovertemplate="<b>%{y}</b><br>Cash definitivo: %{x:.1f}%<br>%{customdata}<extra></extra>",
     ))
 
     anotaciones = []
     for _, fila in df.iterrows():
-        texto = fila["recomendacion"]
-        if "DECISION FORZADA -> ENTRAR" in texto:
-            color_txt = color_forzado_entrar
-        elif "DECISION FORZADA -> ESPERAR" in texto:
-            color_txt = color_forzado_esperar
-        else:
-            color_txt = color_texto_normal
+        accion = fila["accion"]
+        color_txt = COLORES_ACCION.get(accion, COLOR_TEXTO_NORMAL)
         peso_obj = fila["peso_objetivo_pct"]
         peso_obj_txt = f"{peso_obj:.1f}%" if not pd.isna(peso_obj) else "?"
-        linea1 = f"<b>{_reco_corta(texto)}</b>"
+        if accion == "CIERRE: CASH":
+            detalle = f"{fila['cash_definitivo_pct']:.0f}% a cash"
+        elif fila["delta_sugerido_hoy_pct"] > 0:
+            detalle = f"+{fila['delta_sugerido_hoy_pct']:.0f}%"
+        else:
+            detalle = "sin cambios"
+        linea1 = f"<b>{accion} · {detalle}</b>"
         linea2 = (
-            f"<span style='font-size:10px;color:{color_texto_normal}'>"
+            f"<span style='font-size:10px;color:{COLOR_TEXTO_NORMAL}'>"
             f"peso obj. {peso_obj_txt} · hoy +{fila['delta_puntos_portafolio']:.2f} pts portafolio</span>"
         )
         anotaciones.append(dict(
@@ -506,14 +574,21 @@ def graficar_resumen(resumen):
             font=dict(size=12, color=color_txt),
         ))
 
+    subtitulo = (
+        "cierre del ciclo: la fraccion no invertida se compra al 100% o queda en cash"
+        if es_ultimo_dia else "entrada por goteo segun el score de conviccion"
+    )
     fig.update_layout(
         barmode="stack",
-        title="Estado de entrada por activo — % del PESO OBJETIVO propio de cada activo (no del capital total)",
-        xaxis=dict(title="% del peso objetivo del activo ya invertido", range=[0, 100], ticksuffix="%"),
+        title=(
+            f"CICLO {ciclo} · DIA {dia} DE {DIAS_CICLO} — {subtitulo}"
+            "<br><span style='font-size:12px'>% del PESO OBJETIVO propio de cada activo (no del capital total)</span>"
+        ),
+        xaxis=dict(title="% del peso objetivo del activo", range=[0, 100], ticksuffix="%"),
         yaxis=dict(title=None, categoryorder="array", categoryarray=df["ticker"].tolist()),
         template="plotly_white",
         legend=dict(orientation="h", yanchor="top", y=-0.12, x=0),
-        margin=dict(r=340, l=80, t=70, b=90),
+        margin=dict(r=340, l=80, t=90, b=90),
         annotations=anotaciones,
         height=max(420, 58 * len(df) + 170),
         width=1200,
@@ -525,11 +600,10 @@ def graficar_resumen(resumen):
 def correr_entry_signal():
     hist_df = cargar_historial()
 
-    estado = cargar_estado()
-    if estado is None:
-        estado = inicializar_estado()
-    else:
-        estado = permitir_correccion_manual(estado)
+    estado = flujo_inicio(cargar_estado())
+    dia_ciclo = estado["dia_ciclo"]
+    ciclo = estado["ciclo"]
+    es_ultimo_dia = dia_ciclo >= DIAS_CICLO
 
     filas_nuevas = []
     for i, ticker in enumerate(TICKERS):
@@ -542,6 +616,9 @@ def correr_entry_signal():
             time.sleep(SEGUNDOS_ENTRE_LLAMADAS_STOCKS)
 
     df_nuevo = pd.DataFrame(filas_nuevas)
+    if df_nuevo.empty:
+        guardar_estado(estado)
+        return pd.DataFrame(), hist_df
 
     hist_actualizado = pd.concat([hist_df, df_nuevo], ignore_index=True)
     # Si el mismo ticker ya tiene una fila con la fecha de hoy, se queda solo la mas reciente
@@ -551,57 +628,64 @@ def correr_entry_signal():
     hist_actualizado.to_csv(HIST_PATH, index=False)
 
     # ---- Combina el score de hoy con el estado de entradas ya tomadas ----
-    hoy = datetime.now(timezone.utc).date().isoformat()
     filas_estado = []
     for _, fila in df_nuevo.iterrows():
         ticker = fila["ticker"]
-        info = estado.setdefault(
-            ticker, {"pct_ya_invertido": 0.0, "dias_score_bajo": 0, "ultima_actualizacion": hoy}
-        )
-        pct_previo = info["pct_ya_invertido"]
+        activo = estado["activos"].setdefault(ticker, _activo_vacio())
+        pct_previo = activo["pct_ya_invertido"]
         pct_objetivo_hoy = fila["pct_entrada_sugerido"]
         peso_objetivo = PESOS_OBJETIVO.get(ticker, np.nan)
-
-        if fila["score_conviccion"] < UMBRAL_MEDIO:
-            info["dias_score_bajo"] += 1
-        else:
-            info["dias_score_bajo"] = 0
+        pct_cash = 0.0
 
         if pct_previo >= 0.999:
             delta = 0.0
-            recomendacion = "COMPLETO (100%)"
-        elif info["dias_score_bajo"] >= UMBRAL_DIAS_DECISION_FORZADA:
-            decision, motivo = evaluar_decision_forzada(ticker, hist_actualizado)
+            accion = "COMPLETO"
+            recomendacion = "COMPLETO (100% del peso objetivo)"
+            activo["decision_final"] = "ENTRAR" if es_ultimo_dia else activo["decision_final"]
+        elif es_ultimo_dia:
+            # Dia 5: no hay goteo adicional, se cierra el ciclo en firme.
+            decision, motivo = evaluar_flujo_opciones(ticker, hist_actualizado)
             if decision == "ENTRAR":
                 delta = 1.0 - pct_previo
-                info["dias_score_bajo"] = 0
-                recomendacion = f"DECISION FORZADA -> ENTRAR AL 100% ({motivo})"
+                accion = "CIERRE: ENTRAR"
+                recomendacion = f"CIERRE DIA {DIAS_CICLO} -> COMPRAR EL {delta*100:.1f}% RESTANTE ({motivo})"
             else:
                 delta = 0.0
-                recomendacion = f"DECISION FORZADA -> ESPERAR ({motivo})"
+                pct_cash = 1.0 - pct_previo
+                accion = "CIERRE: CASH"
+                recomendacion = f"CIERRE DIA {DIAS_CICLO} -> DEJAR {pct_cash*100:.1f}% EN CASH ({motivo})"
+            activo["decision_final"] = decision
         else:
             delta = max(0.0, pct_objetivo_hoy - pct_previo)
             if delta > 0:
+                accion = "SUMAR"
                 recomendacion = "COMPLETAR A 100%" if pct_objetivo_hoy >= 1.0 else f"SUMAR +{delta*100:.1f}%"
             else:
+                accion = "MANTENER"
                 recomendacion = "MANTENER (ya en el nivel objetivo de hoy)"
 
-        info["pct_ya_invertido"] = min(1.0, pct_previo + delta)
-        info["ultima_actualizacion"] = hoy
+        pct_final = min(1.0, pct_previo + delta)
+        activo["pct_ya_invertido"] = pct_final
+        activo["pct_cash_consolidado"] = pct_cash
 
         filas_estado.append({
+            "ciclo": ciclo,
+            "dia_ciclo": dia_ciclo,
             "ticker": ticker,
             "peso_objetivo_pct": round(peso_objetivo * 100, 2) if not pd.isna(peso_objetivo) else np.nan,
             "pct_ya_invertido_previo": round(pct_previo * 100, 1),
             "pct_objetivo_hoy": round(pct_objetivo_hoy * 100, 1),
             "delta_sugerido_hoy_pct": round(delta * 100, 1),
+            "pct_invertido_final_pct": round(pct_final * 100, 1),
+            "cash_definitivo_pct": round(pct_cash * 100, 1),
             "delta_puntos_portafolio": (
                 round(delta * peso_objetivo * 100, 2) if not pd.isna(peso_objetivo) else np.nan
             ),
-            "dias_score_bajo": info["dias_score_bajo"],
+            "accion": accion,
             "recomendacion": recomendacion,
         })
 
+    estado["ciclo_cerrado"] = es_ultimo_dia
     guardar_estado(estado)
 
     df_estado = pd.DataFrame(filas_estado)
@@ -611,8 +695,40 @@ def correr_entry_signal():
 
     return resumen, hist_actualizado
 
+def imprimir_resumen(resumen):
+    if resumen.empty:
+        print("\nSin datos: ningun ticker devolvio indicadores.")
+        return
+
+    dia = int(resumen["dia_ciclo"].iloc[0])
+    ciclo = int(resumen["ciclo"].iloc[0])
+    print(f"\n=== CICLO {ciclo} · DIA {dia} DE {DIAS_CICLO} ===")
+
+    columnas = [
+        "dia_ciclo", "ticker", "spot", "score_conviccion", "peso_objetivo_pct",
+        "pct_ya_invertido_previo", "delta_sugerido_hoy_pct", "pct_invertido_final_pct",
+        "cash_definitivo_pct", "delta_puntos_portafolio", "accion", "recomendacion",
+    ]
+    print(resumen[columnas].to_string(index=False))
+
+    pts_invertidos = (resumen["pct_invertido_final_pct"] / 100 * resumen["peso_objetivo_pct"]).sum()
+    pts_cash = (resumen["cash_definitivo_pct"] / 100 * resumen["peso_objetivo_pct"]).sum()
+    if dia >= DIAS_CICLO:
+        entrar = resumen[resumen["accion"] == "CIERRE: ENTRAR"]["ticker"].tolist()
+        a_cash = resumen[resumen["accion"] == "CIERRE: CASH"]["ticker"].tolist()
+        print(f"\nCIERRE DE CICLO (dia {DIAS_CICLO}) — decision definitiva, sin goteo adicional:")
+        print(f"  Compra del restante al 100%: {', '.join(entrar) if entrar else '(ninguno)'}")
+        print(f"  Consolidado en cash / no entrar: {', '.join(a_cash) if a_cash else '(ninguno)'}")
+        print(f"  Asignacion final invertida: {pts_invertidos:.2f} pts de portafolio")
+        print(f"  Reserva final en cash: {pts_cash:.2f} pts de portafolio")
+    else:
+        pendiente = resumen["peso_objetivo_pct"].sum() - pts_invertidos
+        print(f"\nDia {dia} de {DIAS_CICLO} — quedan {DIAS_CICLO - dia} dia(s) de goteo antes del cierre forzado.")
+        print(f"  Invertido tras hoy: {pts_invertidos:.2f} pts de portafolio")
+        print(f"  Pendiente por asignar: {pendiente:.2f} pts de portafolio")
+
 resumen, historial = correr_entry_signal()
-print(resumen.to_string(index=False))
+imprimir_resumen(resumen)
 
 fig_resumen = graficar_resumen(resumen)
 if fig_resumen is not None:
