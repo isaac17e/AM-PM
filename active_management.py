@@ -47,6 +47,7 @@ POLYGON_BASE_URL = "https://api.polygon.io"
 
 polygon_max_retries    = 2
 polygon_retry_wait_sec = 15
+polygon_min_interval_sec = 13.0  # espaciado global entre llamadas: el plan actual limita ~5/min
 polygon_max_pages      = 40
 polygon_page_limit     = 250
 
@@ -87,14 +88,47 @@ score_threshold_aumentar = 50
 score_threshold_mantener = 0
 score_threshold_recortar = -50
 
+# --- capa de riesgo de portafolio ---
+corr_method             = "sample"       # "ewma" | "rmt" | "sample"
+# Con N=8 activos y T~275 dias, la muestra cruda esta bien condicionada (T >> N):
+# recupera relaciones conocidas (GLD-SLV ~0.8) que el shrinkage de EWMA/RMT, calibrado
+# a la memoria corta del EWMA (T efectivo ~17 obs con lambda=0.94), aplana o inventa.
+# Revisar si la cartera crece mucho en numero de activos.
+corr_lookback_days      = 400
+corr_ewma_lambda        = 0.94
+corr_eig_floor          = 1e-8
+corr_min_observations   = 20
+atm_iv_n_strikes        = 6
+history_request_pause_sec = 1.0
+history_max_retries       = 4
+
+ctr_cap_multiple        = 1.5            # techo de CTR = multiplo del reparto equiponderado
+guardrail_max_iter      = 25
+guardrail_damping       = 0.6
+guardrail_tolerance     = 1e-4
+guardrail_forced_passes = 10
+guardrail_acciones_receptoras = ("AUMENTAR", "MANTENER")
+guardrail_max_weight_growth   = 1.35   # un receptor no crece mas de 35% sobre su peso tactico
+
+# --- historial de riesgo y regimen (persistencia entre corridas) ---
+risk_history_path      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portfolio_risk_history.csv")
+risk_regime_min_history = 20   # corridas minimas antes de confiar en un percentil
+risk_regime_alto_pct    = 80   # percentil de vol_portafolio por encima del cual se marca estres
+risk_regime_bajo_pct    = 20   # percentil de ratio_diversificacion por debajo del cual se marca colapso
+
 gamma_profile_colors = {"positivo": "#2E7D32", "negativo": "#C62828", "flip": "#1565C0"}
 allocation_colors    = {"Actual": "#78909C", "Sugerido": "#1565C0"}
+risk_layer_colors    = {"antes": "#B0BEC5", "despues": "#00695C", "techo": "#C62828"}
 
 # ============================================================================
 # BLOQUE 2: EXTRACCION Y PROCESAMIENTO DE OPCIONES (POLYGON API v3)
 # ============================================================================
 
+_last_polygon_call_ts = 0.0  # espaciado global entre llamadas, cualquier endpoint
+
+
 def polygon_get(url, params=None, api_key=polygon_api_key, max_retries=polygon_max_retries):
+    global _last_polygon_call_ts
     if params is None:
         params = {}
     params = dict(params)
@@ -102,11 +136,16 @@ def polygon_get(url, params=None, api_key=polygon_api_key, max_retries=polygon_m
     attempt = 0
     while True:
         attempt += 1
+        espera = polygon_min_interval_sec - (time.time() - _last_polygon_call_ts)
+        if espera > 0:
+            time.sleep(espera)
         try:
             resp = requests.get(url, params=params, timeout=20)
         except requests.exceptions.RequestException as e:
+            _last_polygon_call_ts = time.time()
             warnings.warn(f"Fallo de red en {url}: {e}")
             return None
+        _last_polygon_call_ts = time.time()
         status = resp.status_code
         if status == 200:
             try:
@@ -616,7 +655,462 @@ def calculate_tactical_score(analysis):
     }
 
 # ============================================================================
-# BLOQUE 5: REBALANCEO DEL PORTAFOLIO Y ASIGNACION DE CASH
+# BLOQUE 5: CAPA DE RIESGO DE PORTAFOLIO (CORRELACION Y ATRIBUCION DE EULER)
+# Convierte los analisis por ticker en una vista de portafolio: volatilidad
+# implicita por activo desde la cadena, matriz de correlacion historica
+# (EWMA / RMT), covarianza y atribucion de riesgo por descomposicion de Euler.
+# La correlacion entra por una sola matriz para poder sustituirla mas adelante
+# por una correlacion implicita despejada de opciones sobre indice.
+# ============================================================================
+
+def get_price_history(tickers, lookback_days=corr_lookback_days, api_key=polygon_api_key):
+    end = date.today()
+    start = end - timedelta(days=lookback_days)
+    series = {}
+
+    for i, tk in enumerate(tickers):
+        if i > 0:
+            time.sleep(history_request_pause_sec)  # el plan gratuito de Polygon limita por minuto
+        url = (f"{POLYGON_BASE_URL}/v2/aggs/ticker/{tk}/range/1/day/"
+               f"{start.isoformat()}/{end.isoformat()}")
+        resp = polygon_get(url, params={"adjusted": "true", "sort": "asc", "limit": 50000},
+                           api_key=api_key, max_retries=history_max_retries)
+        rows = (resp or {}).get("results") or []
+        if not rows:
+            warnings.warn(f"Sin historico de precios para {tk}: queda fuera de la capa de riesgo.")
+            continue
+        idx = pd.to_datetime([r["t"] for r in rows], unit="ms").normalize()
+        series[tk] = pd.Series([float(r["c"]) for r in rows], index=idx, name=tk)
+
+    if not series:
+        return pd.DataFrame()
+    return pd.DataFrame(series).dropna()
+
+
+def _cov_to_corr(cov):
+    d = np.sqrt(np.clip(np.diag(cov), 1e-16, None))
+    corr = cov / np.outer(d, d)
+    np.fill_diagonal(corr, 1.0)
+    return np.clip(corr, -1.0, 1.0)
+
+
+def _nearest_pd_corr(corr, eig_floor=corr_eig_floor):
+    corr = 0.5 * (corr + corr.T)
+    vals, vecs = np.linalg.eigh(corr)
+    vals = np.clip(vals, eig_floor, None)
+    return _cov_to_corr(vecs @ np.diag(vals) @ vecs.T)
+
+
+def _ewma_cov(rets, lam=corr_ewma_lambda):
+    t = rets.shape[0]
+    w = (1.0 - lam) * lam ** np.arange(t - 1, -1, -1)
+    w /= w.sum()
+    x = rets - np.average(rets, axis=0, weights=w)
+    return (x * w[:, None]).T @ x
+
+
+def _rmt_filter(corr, t):
+    # Random Matrix Theory: los autovalores por debajo del borde de
+    # Marchenko-Pastur son ruido muestral y se colapsan a su promedio. El "t"
+    # debe ser el tamano muestral EFECTIVO de la matriz que se filtra, no el
+    # numero de filas crudo: una matriz EWMA con lambda alto viene de muchas
+    # menos observaciones independientes de lo que sugiere su historico.
+    n = corr.shape[0]
+    if t <= n + 1:
+        warnings.warn(
+            f"T efectivo = {t:.1f} <= N + 1 = {n+1}: con este numero de activos y esta "
+            "vida media del EWMA no hay observaciones independientes suficientes para "
+            "separar senal de ruido. Solo se proyecta a definida positiva (sin filtrar)."
+        )
+        return _nearest_pd_corr(corr)
+    vals, vecs = np.linalg.eigh(corr)
+    lam_plus = (1.0 + math.sqrt(n / t)) ** 2
+    noise = vals < lam_plus
+    noise[-1] = False  # el modo de mercado siempre se conserva
+    if noise.sum() > 0:
+        vals = vals.copy()
+        vals[noise] = vals[noise].sum() / noise.sum()
+    return _nearest_pd_corr(vecs @ np.diag(vals) @ vecs.T)
+
+
+def _ewma_effective_n(lam):
+    # Vida media efectiva de un EWMA: cuantas observaciones independientes
+    # equivalen a su ventana de memoria (RiskMetrics, misma convencion que
+    # se usa para fijar el tamano de ventana de una vol EWMA).
+    return 1.0 / (1.0 - lam)
+
+
+def estimate_correlation(prices, method=corr_method):
+    n = prices.shape[1]
+    if n <= 1:
+        return np.ones((max(n, 1), max(n, 1)))
+
+    rets = np.log(prices.astype(float)).diff().dropna().values
+    if rets.shape[0] < corr_min_observations:
+        warnings.warn(f"Menos de {corr_min_observations} retornos: se asume correlacion nula (identidad).")
+        return np.eye(n)
+
+    if method == "sample":
+        corr = _cov_to_corr(np.cov(rets, rowvar=False))
+    elif method == "ewma":
+        corr = _cov_to_corr(_ewma_cov(rets))
+    elif method == "rmt":
+        t_efectivo = min(_ewma_effective_n(corr_ewma_lambda), rets.shape[0])
+        corr = _rmt_filter(_cov_to_corr(_ewma_cov(rets)), t_efectivo)
+    else:
+        raise ValueError(f"Metodo de correlacion desconocido: {method}")
+
+    return _nearest_pd_corr(corr)
+
+
+def implied_sigma_annual(analysis, n_strikes=atm_iv_n_strikes):
+    # Volatilidad implicita anualizada ATM, ponderada por open interest sobre
+    # los strikes mas cercanos al spot. Es la pieza forward-looking del modelo.
+    if analysis is None or analysis.get("status") != "OK":
+        return np.nan
+
+    chain = analysis.get("chain")
+    spot = analysis.get("spot_price")
+    if chain is None or chain.empty or pd.isna(spot):
+        return np.nan
+
+    valid = chain[(chain["iv"] > 0) & chain["iv"].notna()].copy()
+    if valid.empty:
+        return np.nan
+
+    valid["dist"] = (valid["strike"] - spot).abs()
+    near = valid.nsmallest(n_strikes, "dist")
+    if near.empty:
+        return np.nan
+
+    pesos = near["open_interest"].fillna(0).to_numpy(dtype=float) + 1.0
+    iv = near["iv"].to_numpy(dtype=float)
+    sigma = float(np.average(iv, weights=pesos))
+
+    if not np.isfinite(sigma) or sigma <= 0:
+        return np.nan
+    return sigma
+
+
+def historical_sigma_annual(prices, ticker, trading_days_per_year=252):
+    if prices.empty or ticker not in prices.columns:
+        return np.nan
+    rets = np.log(prices[ticker].astype(float)).diff().dropna()
+    if len(rets) < corr_min_observations:
+        return np.nan
+    return float(rets.std(ddof=1) * math.sqrt(trading_days_per_year))
+
+
+def euler_risk_attribution(tickers, weights, sigma, corr):
+    # Descomposicion de Euler: sigma_p es homogenea de grado 1 en los pesos,
+    # asi que MCR_i = d sigma_p / d w_i y los CTR_i suman sigma_p exacto.
+    w = np.asarray(weights, dtype=float)
+    sig = np.asarray(sigma, dtype=float)
+
+    cov = np.outer(sig, sig) * corr
+    var_p = float(w @ cov @ w)
+    sig_p = math.sqrt(max(var_p, 1e-16))
+
+    mcr = (cov @ w) / sig_p
+    ctr = w * mcr
+    ctr_pct = ctr / sig_p if sig_p > 0 else np.full_like(ctr, np.nan)
+
+    vol_media_ponderada = float(np.abs(w) @ sig)
+    ratio_div = vol_media_ponderada / sig_p if sig_p > 0 else np.nan
+
+    num = var_p - float(np.sum(w**2 * sig**2))
+    den = 2.0 * float(np.sum(np.triu(np.outer(w, w) * np.outer(sig, sig), k=1)))
+    corr_implicita = num / den if abs(den) > 1e-14 else np.nan
+
+    tabla = pd.DataFrame({
+        "Ticker": list(tickers),
+        "Peso": w,
+        "Vol_Individual": 100.0 * sig,
+        "MCR": mcr,
+        "CTR_pts": 100.0 * ctr,
+        "CTR_Pct": 100.0 * ctr_pct,
+        "Rho_vs_Portafolio": np.divide(mcr, sig, out=np.full_like(mcr, np.nan), where=sig > 0),
+    })
+    tabla["Intensidad_Riesgo"] = np.divide(
+        tabla["CTR_Pct"].to_numpy(), 100.0 * w,
+        out=np.full(len(w), np.nan), where=w > 1e-12)
+
+    metricas = {
+        "vol_portafolio": 100.0 * sig_p,
+        "vol_media_ponderada": 100.0 * vol_media_ponderada,
+        "ratio_diversificacion": ratio_div,
+        "beneficio_diversificacion_pts": 100.0 * (vol_media_ponderada - sig_p),
+        "correlacion_implicita_media": corr_implicita,
+        "exposicion_riesgosa": float(w.sum()),
+    }
+    return tabla, metricas, cov
+
+
+def build_risk_inputs(analyses, tickers, api_key=polygon_api_key):
+    prices = get_price_history(tickers, api_key=api_key)
+
+    # Un activo entra en la capa de riesgo solo si tiene volatilidad Y
+    # historico: sin historico no hay fila ni columna en la correlacion. Se
+    # excluye ese activo y el resto conserva su matriz real; su peso queda
+    # intacto porque el guardrail solo escribe sobre los tickers que evalua.
+    sigmas, fuentes, validos, excluidos = [], [], [], []
+    for tk in tickers:
+        if tk not in prices.columns:
+            excluidos.append((tk, "sin historico de precios"))
+            continue
+        s = implied_sigma_annual(analyses.get(tk))
+        fuente = "IMPLICITA_ATM"
+        if pd.isna(s):
+            s = historical_sigma_annual(prices, tk)
+            fuente = "HISTORICA_FALLBACK"
+        if pd.isna(s):
+            excluidos.append((tk, "sin volatilidad implicita ni historica"))
+            continue
+        validos.append(tk)
+        sigmas.append(s)
+        fuentes.append(fuente)
+
+    for tk, motivo in excluidos:
+        warnings.warn(f"{tk} queda fuera de la capa de riesgo ({motivo}): su peso no se ajusta.")
+
+    if len(validos) < 2:
+        warnings.warn("Menos de 2 activos utilizables: se omite la capa de riesgo de portafolio.")
+        return None
+
+    return {
+        "tickers": validos,
+        "sigma": np.asarray(sigmas, dtype=float),
+        "fuente_vol": fuentes,
+        "corr": estimate_correlation(prices[validos]),
+        "prices": prices,
+        "excluidos": excluidos,
+    }
+
+
+def apply_diversification_guardrail(tabla_rebalanceo, risk_inputs,
+                                     cap_multiple=ctr_cap_multiple,
+                                     max_iter=guardrail_max_iter,
+                                     damping=guardrail_damping):
+    # Recalcula la atribucion de riesgo con los pesos que propuso el scoring
+    # tactico y recorta cualquier nombre que supere el techo de CTR. El peso
+    # liberado va primero a los activos con holgura de riesgo y solo el
+    # remanente a caja.
+    if risk_inputs is None:
+        return tabla_rebalanceo, None
+
+    tickers = risk_inputs["tickers"]
+    sigma = risk_inputs["sigma"]
+    corr = risk_inputs["corr"]
+
+    tabla = tabla_rebalanceo.copy()
+    fila_cash = tabla["Ticker"] == "CASH"
+    idx = {tk: tabla.index[tabla["Ticker"] == tk][0]
+           for tk in tickers if (tabla["Ticker"] == tk).any()}
+    tickers = [tk for tk in tickers if tk in idx]
+    if len(tickers) < 2:
+        return tabla_rebalanceo, None
+
+    pos = [risk_inputs["tickers"].index(tk) for tk in tickers]
+    sigma = sigma[pos]
+    corr = corr[np.ix_(pos, pos)]
+
+    w0 = np.array([float(tabla.at[idx[tk], "Nuevo_Peso"]) for tk in tickers])
+    acciones = np.array([str(tabla.at[idx[tk], "Accion"]) for tk in tickers])
+
+    tabla_antes, metricas_antes, cov = euler_risk_attribution(tickers, w0, sigma, corr)
+
+    def ctr_share(pesos):
+        sig_p = math.sqrt(max(float(pesos @ cov @ pesos), 1e-16))
+        return (pesos * ((cov @ pesos) / sig_p)) / sig_p
+
+    cap = cap_multiple / len(tickers)
+    ctr_inicial = ctr_share(w0)
+    w = w0.copy()
+    caja_extra = 0.0
+    forzados = []
+
+    for _ in range(max_iter):
+        ctr_pct = ctr_share(w)
+        exceso = ctr_pct > cap + guardrail_tolerance
+        if not exceso.any():
+            break
+
+        w_new = w.copy()
+        w_new[exceso] = w[exceso] * (cap / ctr_pct[exceso]) ** damping
+        liberado = float((w - w_new).sum())
+
+        # El peso liberado va a los activos con holgura de riesgo que el
+        # scoring tactico no queria reducir. Un activo con CTR negativo (una
+        # cobertura genuina) tiene la holgura mas alta y absorberia todo el
+        # reparto, asi que ademas se limita cuanto puede crecer cada receptor
+        # sobre su peso tactico. Lo que no cabe termina en caja.
+        receptor = (~exceso) & np.isin(acciones, guardrail_acciones_receptoras) & (w_new > 1e-6)
+        holgura = np.where(receptor, np.clip(cap - ctr_pct, 0.0, None), 0.0)
+        capacidad = np.where(receptor, np.clip(w0 * guardrail_max_weight_growth - w_new, 0.0, None), 0.0)
+
+        if holgura.sum() > 1e-12:
+            asignacion = np.minimum(liberado * holgura / holgura.sum(), capacidad)
+            w_new = w_new + asignacion
+            caja_extra += liberado - float(asignacion.sum())
+        else:
+            caja_extra += liberado
+        w = w_new
+
+    # Pase final: lo que siga por encima del techo se recorta contra caja. El
+    # escalado es lineal y el CTR no lo es, asi que se repite hasta cerrar.
+    for _ in range(guardrail_forced_passes):
+        ctr_pct = ctr_share(w)
+        exceso = ctr_pct > cap + guardrail_tolerance
+        if not exceso.any():
+            break
+        w_forzado = w.copy()
+        w_forzado[exceso] = w[exceso] * (cap / ctr_pct[exceso])
+        caja_extra += float((w - w_forzado).sum())
+        forzados = sorted(set(forzados) | {tickers[i] for i in np.flatnonzero(exceso)})
+        w = w_forzado
+
+    ctr_final = ctr_share(w)
+    bitacora = []
+    for i, tk in enumerate(tickers):
+        if abs(w[i] - w0[i]) < 1e-6:
+            continue
+        marca = " (recorte forzado)" if tk in forzados else ""
+        bitacora.append(
+            f"{tk}: CTR {100*ctr_inicial[i]:.1f}% -> {100*ctr_final[i]:.1f}% "
+            f"| peso {100*w0[i]:.2f}% -> {100*w[i]:.2f}%{marca}")
+
+    for tk, peso in zip(tickers, w):
+        tabla.at[idx[tk], "Nuevo_Peso"] = peso
+    if caja_extra > 0:
+        if fila_cash.any():
+            tabla.loc[fila_cash, "Nuevo_Peso"] = tabla.loc[fila_cash, "Nuevo_Peso"] + caja_extra
+        else:
+            warnings.warn("Sin fila CASH donde aparcar el peso liberado: la renormalizacion "
+                          "revierte parte del recorte del guardrail.")
+
+    suma = tabla["Nuevo_Peso"].sum(skipna=True)
+    if abs(suma - 1) > 1e-6 and suma > 0:
+        tabla["Nuevo_Peso"] = tabla["Nuevo_Peso"] / suma
+
+    w_final = np.array([float(tabla.at[idx[tk], "Nuevo_Peso"]) for tk in tickers])
+    tabla_despues, metricas_despues, _ = euler_risk_attribution(tickers, w_final, sigma, corr)
+
+    reporte = {
+        "cap_ctr": 100.0 * cap,
+        "atribucion_antes": tabla_antes,
+        "atribucion_despues": tabla_despues,
+        "metricas_antes": metricas_antes,
+        "metricas_despues": metricas_despues,
+        "correlacion": pd.DataFrame(corr, index=tickers, columns=tickers),
+        "fuente_vol": dict(zip(risk_inputs["tickers"], risk_inputs["fuente_vol"])),
+        "excluidos": risk_inputs.get("excluidos", []),
+        "caja_por_guardrail": caja_extra,
+        "bitacora": bitacora,
+    }
+    return tabla, reporte
+
+
+def cargar_historial_riesgo():
+    if os.path.exists(risk_history_path):
+        return pd.read_csv(risk_history_path, parse_dates=["fecha"])
+    return pd.DataFrame()
+
+
+def evaluar_regimen_riesgo(risk_report, hist_df):
+    # Compara la corrida de HOY contra el historial previo (sin incluir la fila
+    # de hoy): un VIX_port o un ratio de diversificacion solo dicen algo si se
+    # leen contra su propia historia, no como nivel aislado.
+    if risk_report is None:
+        return None
+
+    md = risk_report["metricas_despues"]
+    n_obs = len(hist_df)
+    resultado = {
+        "n_observaciones": n_obs,
+        "vol_portafolio": md["vol_portafolio"],
+        "ratio_diversificacion": md["ratio_diversificacion"],
+        "alertas": [],
+    }
+
+    if n_obs < risk_regime_min_history:
+        resultado["estado"] = "HISTORIAL_INSUFICIENTE"
+        resultado["mensaje"] = (
+            f"{n_obs} corrida(s) registrada(s); se necesitan al menos "
+            f"{risk_regime_min_history} para que un percentil sea confiable."
+        )
+        return resultado
+
+    serie_vol = hist_df["vol_portafolio_despues"].dropna()
+    serie_ratio = hist_df["ratio_diversificacion_despues"].dropna()
+    pct_vol = float((serie_vol < md["vol_portafolio"]).mean() * 100)
+    pct_ratio = float((serie_ratio < md["ratio_diversificacion"]).mean() * 100)
+
+    resultado["estado"] = "OK"
+    resultado["percentil_vol_portafolio"] = pct_vol
+    resultado["percentil_ratio_diversificacion"] = pct_ratio
+
+    if pct_vol >= risk_regime_alto_pct:
+        resultado["alertas"].append(
+            f"REGIMEN DE ESTRES: vol_portafolio ({md['vol_portafolio']:.2f}%) en el percentil "
+            f"{pct_vol:.0f} de sus ultimas {n_obs} corridas."
+        )
+    if pct_ratio <= risk_regime_bajo_pct:
+        resultado["alertas"].append(
+            f"DIVERSIFICACION COMPRIMIDA: ratio_diversificacion ({md['ratio_diversificacion']:.2f}) "
+            f"en el percentil {pct_ratio:.0f} (mas bajo de lo usual en sus ultimas {n_obs} corridas)."
+        )
+    return resultado
+
+
+def registrar_historial_riesgo(risk_report, hist_df):
+    if risk_report is None:
+        warnings.warn("Sin capa de riesgo en esta corrida: no se registra en el historial.")
+        return hist_df
+
+    ma, md = risk_report["metricas_antes"], risk_report["metricas_despues"]
+    fila = pd.DataFrame([{
+        "fecha": datetime.now(),
+        "corr_method": corr_method,
+        "cash_reserve_limit": cash_reserve_limit,
+        "vol_portafolio_antes": ma["vol_portafolio"],
+        "vol_portafolio_despues": md["vol_portafolio"],
+        "vol_media_ponderada_despues": md["vol_media_ponderada"],
+        "ratio_diversificacion_antes": ma["ratio_diversificacion"],
+        "ratio_diversificacion_despues": md["ratio_diversificacion"],
+        "beneficio_diversificacion_pts_despues": md["beneficio_diversificacion_pts"],
+        "correlacion_implicita_media_despues": md["correlacion_implicita_media"],
+        "exposicion_riesgosa_despues": md["exposicion_riesgosa"],
+    }])
+
+    hist_actualizado = pd.concat([hist_df, fila], ignore_index=True)
+    # Si ya se corrio hoy, se queda solo la fila mas reciente en vez de duplicarla
+    hist_actualizado["fecha_dia"] = pd.to_datetime(hist_actualizado["fecha"]).dt.date
+    hist_actualizado = hist_actualizado.drop_duplicates(subset=["fecha_dia"], keep="last")
+    hist_actualizado = hist_actualizado.drop(columns=["fecha_dia"]).sort_values("fecha")
+    hist_actualizado.to_csv(risk_history_path, index=False)
+    return hist_actualizado
+
+
+def print_risk_regime(regimen):
+    if regimen is None:
+        return
+    print("\n-- Regimen de riesgo (contra historial propio) --")
+    if regimen["estado"] == "HISTORIAL_INSUFICIENTE":
+        print(f"  {regimen['mensaje']}")
+        return
+    print(f"  vol_portafolio: {regimen['vol_portafolio']:.2f}% (percentil {regimen['percentil_vol_portafolio']:.0f} "
+          f"de {regimen['n_observaciones']} corridas)")
+    print(f"  ratio_diversificacion: {regimen['ratio_diversificacion']:.2f} (percentil "
+          f"{regimen['percentil_ratio_diversificacion']:.0f})")
+    if regimen["alertas"]:
+        for a in regimen["alertas"]:
+            print(f"  [!] {a}")
+    else:
+        print("  Sin alertas: ambas metricas dentro de su rango historico normal.")
+
+
+# ============================================================================
+# BLOQUE 6: REBALANCEO DEL PORTAFOLIO Y ASIGNACION DE CASH
 # ============================================================================
 
 def rebalance_portfolio(portfolio, scores_df, cash_reserve_limit):
@@ -682,7 +1176,7 @@ def rebalance_portfolio(portfolio, scores_df, cash_reserve_limit):
     return tabla_final
 
 # ============================================================================
-# BLOQUE 6: SALIDA GRAFICA Y REPORTE
+# BLOQUE 7: SALIDA GRAFICA Y REPORTE
 # ============================================================================
 
 def generate_executive_dashboard(tabla_rebalanceo):
@@ -796,8 +1290,106 @@ def plot_allocation_comparison(tabla_rebalanceo):
     )
     return fig
 
+def print_risk_report(reporte):
+    if reporte is None:
+        print("\n[Capa de riesgo de portafolio no disponible: datos insuficientes.]")
+        return
+
+    ma, md = reporte["metricas_antes"], reporte["metricas_despues"]
+
+    print("\n================ CAPA DE RIESGO DE PORTAFOLIO ================")
+    print(f"Techo de CTR por activo: {reporte['cap_ctr']:.1f}% del riesgo total "
+          f"({ctr_cap_multiple:.1f}x el reparto equiponderado)\n")
+
+    resumen = pd.DataFrame({
+        "Metrica": ["Vol portafolio (anual, %)", "Vol media ponderada (%)",
+                     "Ratio de diversificacion", "Beneficio diversificacion (pts)",
+                     "Correlacion implicita media", "Exposicion riesgosa (%)"],
+        "Antes": [ma["vol_portafolio"], ma["vol_media_ponderada"], ma["ratio_diversificacion"],
+                   ma["beneficio_diversificacion_pts"], ma["correlacion_implicita_media"],
+                   100 * ma["exposicion_riesgosa"]],
+        "Despues": [md["vol_portafolio"], md["vol_media_ponderada"], md["ratio_diversificacion"],
+                     md["beneficio_diversificacion_pts"], md["correlacion_implicita_media"],
+                     100 * md["exposicion_riesgosa"]],
+    })
+    print(resumen.round(4).to_string(index=False))
+
+    print("\n-- Atribucion de riesgo con los pesos sugeridos --")
+    cols = ["Ticker", "Peso", "Vol_Individual", "MCR", "CTR_pts", "CTR_Pct",
+            "Rho_vs_Portafolio", "Intensidad_Riesgo"]
+    print(reporte["atribucion_despues"][cols].sort_values("CTR_Pct", ascending=False)
+          .round(4).to_string(index=False))
+
+    print("\n-- Fuente de la volatilidad por activo --")
+    print(" | ".join(f"{tk}: {src}" for tk, src in reporte["fuente_vol"].items()))
+
+    if reporte["excluidos"]:
+        print("\n-- Activos FUERA de la capa de riesgo (peso sin ajustar) --")
+        for tk, motivo in reporte["excluidos"]:
+            print(f"  {tk}: {motivo}")
+        print("  Los CTR% de arriba se reparten solo entre los activos evaluados.")
+
+    if reporte["bitacora"]:
+        print("\n-- Ajustes aplicados por el guardrail de concentracion --")
+        for linea in reporte["bitacora"]:
+            print(f"  {linea}")
+        print(f"  Caja adicional generada por el guardrail: {100*reporte['caja_por_guardrail']:.2f}%")
+    else:
+        print("\n-- Guardrail: ningun activo supero el techo de CTR; no hubo ajustes. --")
+    print("==============================================================")
+
+
+def plot_risk_attribution(reporte):
+    if reporte is None:
+        return None
+
+    antes = reporte["atribucion_antes"].set_index("Ticker")
+    despues = reporte["atribucion_despues"].set_index("Ticker")
+    orden = despues["CTR_Pct"].sort_values(ascending=False).index
+    labels = list(orden)
+
+    fig = make_subplots(
+        rows=1, cols=2, column_widths=[0.58, 0.42],
+        subplot_titles=("Contribucion al riesgo total (CTR %)",
+                        f"Correlacion ({corr_method.upper()}) entre activos"),
+    )
+
+    fig.add_trace(go.Bar(x=labels, y=antes.loc[orden, "CTR_Pct"], name="Antes del guardrail",
+                          marker_color=risk_layer_colors["antes"],
+                          hovertemplate="%{x} antes: %{y:.2f}% del riesgo<extra></extra>"),
+                  row=1, col=1)
+    fig.add_trace(go.Bar(x=labels, y=despues.loc[orden, "CTR_Pct"], name="Despues del guardrail",
+                          marker_color=risk_layer_colors["despues"],
+                          customdata=np.stack([100 * despues.loc[orden, "Peso"],
+                                                despues.loc[orden, "Intensidad_Riesgo"]], axis=-1),
+                          hovertemplate="%{x} despues: %{y:.2f}% del riesgo"
+                                        "<br>peso = %{customdata[0]:.2f}%"
+                                        "<br>intensidad = %{customdata[1]:.2f}x<extra></extra>"),
+                  row=1, col=1)
+    fig.add_hline(y=reporte["cap_ctr"], line_color=risk_layer_colors["techo"], line_dash="dash",
+                  annotation_text=f"Techo {reporte['cap_ctr']:.1f}%", annotation_position="top right",
+                  row=1, col=1)
+    fig.add_hline(y=100.0 / len(labels), line_color="#9E9E9E", line_dash="dot",
+                  annotation_text="Risk parity", annotation_position="bottom right",
+                  row=1, col=1)
+
+    corr = reporte["correlacion"].loc[labels, labels]
+    fig.add_trace(go.Heatmap(z=corr.values, x=labels, y=labels, zmid=0, zmin=-1, zmax=1,
+                              colorscale="RdBu_r", showscale=True,
+                              hovertemplate="%{y} vs %{x}: %{z:.2f}<extra></extra>"),
+                  row=1, col=2)
+    fig.update_yaxes(autorange="reversed", row=1, col=2)
+    fig.update_yaxes(title_text="% del riesgo total", row=1, col=1)
+
+    fig.update_layout(
+        title="Riesgo de Portafolio: Concentracion y Correlacion",
+        template="plotly_white", barmode="group", height=520,
+        legend=dict(orientation="h", yanchor="bottom", y=1.06, xanchor="center", x=0.29),
+    )
+    return fig
+
 # ============================================================================
-# BLOQUE 7: ORQUESTACION PRINCIPAL
+# BLOQUE 8: ORQUESTACION PRINCIPAL
 # ============================================================================
 
 def run_active_management_engine(portfolio, horizon_days, api_key, cash_limit):
@@ -808,24 +1400,45 @@ def run_active_management_engine(portfolio, horizon_days, api_key, cash_limit):
     scores_list = [calculate_tactical_score(analyses[tk]) for tk in tickers]
     scores_df = pd.DataFrame(scores_list)
 
-    tabla_rebalanceo = rebalance_portfolio(portfolio, scores_df, cash_limit)
+    tabla_tactica = rebalance_portfolio(portfolio, scores_df, cash_limit)
+
+    # El scoring tactico es transversal y ciego a la correlacion: la capa de
+    # riesgo revisa su propuesta y recorta las concentraciones de riesgo.
+    print("\nConstruyendo la capa de riesgo de portafolio...")
+    risk_inputs = build_risk_inputs(analyses, tickers, api_key)
+    tabla_rebalanceo, risk_report = apply_diversification_guardrail(tabla_tactica, risk_inputs)
 
     dashboard = generate_executive_dashboard(tabla_rebalanceo)
+    print_risk_report(risk_report)
+
+    # El regimen se evalua contra el historial PREVIO (sin la corrida de hoy)
+    # y solo despues se agrega la fila de hoy al archivo.
+    hist_riesgo_previo = cargar_historial_riesgo()
+    regimen_riesgo = evaluar_regimen_riesgo(risk_report, hist_riesgo_previo)
+    print_risk_regime(regimen_riesgo)
+    hist_riesgo = registrar_historial_riesgo(risk_report, hist_riesgo_previo)
 
     gamma_plot = plot_gamma_profiles(analyses)
     allocation_plot = plot_allocation_comparison(tabla_rebalanceo)
+    risk_plot = plot_risk_attribution(risk_report)
 
     return {
         "analyses": analyses,
         "scores": scores_df,
+        "tabla_tactica": tabla_tactica,
         "tabla_rebalanceo": tabla_rebalanceo,
+        "risk_inputs": risk_inputs,
+        "risk_report": risk_report,
+        "regimen_riesgo": regimen_riesgo,
+        "historial_riesgo": hist_riesgo,
         "dashboard": dashboard,
         "gamma_plot": gamma_plot,
         "allocation_plot": allocation_plot,
+        "risk_plot": risk_plot,
     }
 
 # ============================================================================
-# BLOQUE 8: EJECUCION
+# BLOQUE 9: EJECUCION
 # ============================================================================
 
 resultado = run_active_management_engine(portfolio, investment_horizon_days, polygon_api_key, cash_reserve_limit)
@@ -834,6 +1447,9 @@ if resultado["gamma_plot"] is not None:
     resultado["gamma_plot"].show()
 
 resultado["allocation_plot"].show()
+
+if resultado["risk_plot"] is not None:
+    resultado["risk_plot"].show()
 
 print("\n-- Tabla de Rebalanceo (data.frame crudo) --")
 print(resultado["tabla_rebalanceo"])
