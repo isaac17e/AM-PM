@@ -1,5 +1,5 @@
 # =============================================================================
-# BLACK-LITTERMAN PORTFOLIO OPTIMIZATION
+# BLACK-LITTERMAN EXTENDIDO POR MOMENTOS DE ORDEN SUPERIOR MODEL-FREE (BKM)
 # =============================================================================
 
 import warnings
@@ -15,12 +15,23 @@ import pandas as pd
 import requests
 
 import yfinance as yf
-from scipy.optimize import minimize
+from scipy.optimize import minimize, linprog
 from scipy.interpolate import PchipInterpolator
+from scipy.stats import norm
+from scipy import sparse
 import quadprog
 
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
+# --- statsmodels es opcional: si no esta, se usa un HAC propio --------------
+try:
+    import statsmodels.api as sm
+    HAY_STATSMODELS = True
+except ImportError:
+    HAY_STATSMODELS = False
+    print("Aviso: statsmodels no disponible. Se usara un estimador HAC interno "
+          "(Newey-West con kernel de Bartlett) para las primas de riesgo.")
 
 # ------------------------------------------------
 # API KEY - Polygon.io
@@ -65,6 +76,7 @@ PERFILES = {
 # -----------------------------------------------------------------------------
 UMBRAL_PESO_MIN = 0.005
 MAX_TICKERS_FINAL = 10
+PESO_MAX_ACTIVO = 0.35          # cota superior por activo en la optimizacion
 
 # -----------------------------------------------------------------------------
 # 6. TASA LIBRE DE RIESGO - FALLBACK
@@ -83,12 +95,81 @@ USAR_IV_POLYGON = True
 MIN_STRIKES_SLICE = 5
 MIN_DIAS_VENCIMIENTO = 5
 
+# -----------------------------------------------------------------------------
+# 9. MODULO ECONOMETRICO Q -> P (BLOQUE 1D)
+# -----------------------------------------------------------------------------
+PASO_VENTANA_ROLLING = 5        # paso (en dias habiles) entre ventanas rodantes
+MIN_VENTANAS_ROLLING = 12       # ventanas minimas para aceptar la estimacion
+NW_LAGS_AUTO = True             # rezagos NW = floor(4*(T/100)^(2/9)) si True
+NW_LAGS_FIJOS = 6               # usado solo si NW_LAGS_AUTO = False
+WINSOR_MOMENTOS = 0.05          # winsorizacion de colas de momentos realizados
+
+# Bootstrap por bloques: estimador primario de los momentos fisicos (ver 1D.1b).
+N_REP_BOOTSTRAP_MOM = 20        # replicas del bootstrap para los momentos P
+J_POR_REPLICA_MOM = 2000        # trayectorias por replica
+N_MC_DELTA = 200                # replicas del delta-method de la prima no gaussiana
+
+# Rango admisible del parametro de Esscher. Sobre log-retornos coincide con la
+# aversion relativa al riesgo del agente representativo: por eso se restringe a
+# valores no negativos (un theta < 0 describiria un agente amante del riesgo).
+THETA_ESSCHER_COTA = (0.0, 25.0)
+# Difusion relativa del ancla del GMM de theta (ver Bloque 4B).
+THETA_PRIOR_CV = 1.0
+# Guardarrail economico: la prima no gaussiana no puede exceder esta fraccion
+# de la volatilidad fisica del activo. Se informa cuando actua.
+MAX_PRIMA_HM_SIGMA = 0.35
+
+# Cotas de sensatez sobre los momentos proyectados a P (evitan que un outlier
+# de la superficie de opciones contamine todo el posterior).
+COTA_SKEW_P = (-2.5, 1.5)
+COTA_KURT_P = (1.8, 12.0)
+# Piso/techo del ratio sigma_P / sigma_Q (la vol implicita sobreestima la
+# realizada, pero la correccion no puede ser arbitrariamente grande).
+COTA_RATIO_VOL_P = (0.55, 1.25)
+
+# -----------------------------------------------------------------------------
+# 10. [NUEVO] INTEGRACION BAYESIANA NO GAUSSIANA (BLOQUE 7)
+# -----------------------------------------------------------------------------
+METODO_POSTERIOR = "entropy_pooling"   # "entropy_pooling" | "gram_charlier"
+N_ESCENARIOS = 12000                   # tamano del panel de escenarios
+# Longitud media del bloque. Debe ser una fraccion apreciable del horizonte: si
+# es muy corta, el retorno a H dias es suma de muchos bloques casi independientes
+# y el TLC borra artificialmente la asimetria y la curtosis del agregado.
+BOOTSTRAP_BLOQUE = max(21, (MESES_HORIZONTE * DIAS_HABILES_MES) // 4)
+HALF_LIFE_PRIOR = 252                  # vida media (dias) del decay del prior
+SEMILLA = 20260904
+EP_IMPONER_CURTOSIS = True             # incluir restricciones de 4.o momento
+EP_TOL_ENS = 0.10                      # ENS minimo aceptable (fraccion de J)
+
+# -----------------------------------------------------------------------------
+# 11. [NUEVO] RIESGO DE COLA Y MODO DE OPTIMIZACION (BLOQUES 7B / 8B)
+# -----------------------------------------------------------------------------
+NIVEL_CONFIANZA_VAR = 0.95
+NIVELES_CVAR = (0.95, 0.99)
+UMBRAL_OMEGA_RATIO = 0.0        # umbral tau del Omega ratio (en exceso de 0)
+
+MODO_OPTIMIZACION = "mvsk"      # "mvsk" | "cvar"
+# (a) "mvsk": maximiza la utilidad esperada por expansion de Taylor de 4.o orden
+#             U = E[r] - (gamma/2) Var + (lambda3/3) Skew - (lambda4/4) Kurt
+# (b) "cvar": minimiza CVaR_alpha sujeto a E[r] >= RETORNO_MIN_CVAR
+LAMBDA3 = 1.0
+LAMBDA4 = 1.0
+ALPHA_CVAR_OBJETIVO = 0.95
+# Retorno minimo exigido en el modo CVaR. None => se usa el retorno esperado
+# del portafolio de mercado bajo el posterior (restriccion "al menos como el
+# benchmark").
+RETORNO_MIN_CVAR = None
+MAX_ESCENARIOS_LP = 4000        # submuestreo de escenarios para el LP de CVaR
+
 if USAR_IV_POLYGON and not POLYGON_API_KEY:
     raise ValueError(
         "USAR_IV_POLYGON = True pero POLYGON_API_KEY no esta definida. "
         "Configura el secreto 'PolygonAPI' en Colab, o pon USAR_IV_POLYGON = False "
         "para usar el metodo historico."
     )
+
+rng_global = np.random.default_rng(SEMILLA)
+
 
 # =============================================================================
 # FIN BLOQUE 0
@@ -424,6 +505,11 @@ if USAR_IV_POLYGON:
 else:
     print("\n=== USAR_IV_POLYGON = False - usando Sigma 100% historica ===")
     Sigma = Sigma_hist_df.copy()
+    # Definiciones minimas para que el Bloque 1C (BKM) y el 1D (Q -> P) operen
+    # en modo neutro: sin superficie SSVI no hay momentos risk-neutral, y las
+    # primas de riesgo quedan implicitamente en cero.
+    tau_horizonte = MESES_HORIZONTE / 12
+    detalle_ssvi = {}
 
 
 # =============================================================================
@@ -537,6 +623,463 @@ print("\n=== Resumen momentos implicitos (skew=0, kurt=3 => distribucion normal)
 print(pd.DataFrame({"MFIS": np.round(MFIS_vec, 3), "MFIK": np.round(MFIK_vec, 3)}, index=tickers))
 
 # =============================================================================
+# BLOQUE 1D: MODULO ECONOMETRICO Q -> P
+# -----------------------------------------------------------------------------
+# Los momentos BKM del Bloque 1C viven bajo la medida risk-neutral Q, mientras
+# que Black-Litterman opera bajo la fisica P. Aqui se estiman los momentos
+# fisicos al horizonte, se calibran contra los implicitos por regresion de
+# Mincer-Zarnowitz y se obtienen las primas VRP, SRP y KRP y la covarianza
+# Sigma_P. La proyeccion Q -> P se cierra en el Bloque 4B.
+# =============================================================================
+
+print("\n" + "=" * 79)
+print("BLOQUE 1D: AJUSTE ECONOMETRICO Q -> P (VRP / SRP / KRP)")
+print("=" * 79)
+
+retornos_dia = np.log(precios_diarios / precios_diarios.shift(1)).dropna(how="all")
+retornos_dia = retornos_dia[tickers]
+
+H_VENTANA = horizonte_dias   # ventana / agregacion = horizonte de inversion
+
+R_dia = retornos_dia.dropna().values
+T_dia = R_dia.shape[0]
+
+# Ponderacion temporal del prior: decaimiento exponencial con vida media fija.
+peso_tiempo = np.exp(-np.log(2.0) * (T_dia - 1 - np.arange(T_dia)) / HALF_LIFE_PRIOR)
+peso_tiempo = peso_tiempo / peso_tiempo.sum()
+
+
+# -----------------------------------------------------------------------------
+# 1D.0  Bootstrap estacionario por bloques (compartido con el Bloque 7)
+# -----------------------------------------------------------------------------
+
+def bootstrap_estacionario(R, J, H, L_bloque, pesos_inicio, rng, chunk=2000):
+    """Panel (J x n) de log-retornos agregados a H dias.
+
+    Se remuestrean FILAS COMPLETAS, de modo que la dependencia transversal
+    (correlaciones y colas conjuntas) se preserva sin imponer copula alguna.
+    Con probabilidad 1/L se salta a un nuevo indice inicial (muestreado con
+    decaimiento exponencial en el tiempo); si no, se avanza un dia con
+    envoltura circular. Longitudes de bloque geometricas => estacionariedad
+    del esquema de remuestreo (Politis-Romano, 1994).
+    """
+    T_, n_ = R.shape
+    p_salto = 1.0 / max(L_bloque, 1)
+    salida = np.empty((J, n_))
+    hecho = 0
+    while hecho < J:
+        m = min(chunk, J - hecho)
+        idx = np.empty((m, H), dtype=np.int64)
+        idx[:, 0] = rng.choice(T_, size=m, p=pesos_inicio)
+        saltos = rng.random((m, H - 1)) < p_salto
+        nuevos = rng.choice(T_, size=(m, H - 1), p=pesos_inicio)
+        for h in range(1, H):
+            avance = (idx[:, h - 1] + 1) % T_
+            idx[:, h] = np.where(saltos[:, h - 1], nuevos[:, h - 1], avance)
+        salida[hecho:hecho + m] = R[idx].sum(axis=1)
+        hecho += m
+    return salida
+
+
+# -----------------------------------------------------------------------------
+# 1D.1a  Estimador de ventanas rodantes (diagnostico)
+# -----------------------------------------------------------------------------
+
+def momentos_realizados_rolling(serie_diaria, H=H_VENTANA, paso=PASO_VENTANA_ROLLING):
+    """Momentos realizados del retorno agregado a H dias, en ventanas rodantes.
+
+        RV_t    = sum_{d in t} r_d^2                    (exacto, sin supuestos)
+        RSkew_t = sum r_d^3 / RV_t^{3/2}                (agregacion iid)
+        RKurt_t = 3 + (H*sum r_d^4/RV_t^2 - 3)/H        (agregacion iid)
+
+    RV_t es la varianza realizada del retorno a H dias. Las otras dos suponen
+    incrementos iid (Skew_H = Skew_d/sqrt(H), ExKurt_H = ExKurt_d/H), lo que
+    hace que converjan MECANICAMENTE a 0 y 3 al crecer H: a 4 meses ese
+    estimador es vacio y por eso solo se conserva como diagnostico frente al
+    bootstrap por bloques, que es el estimador primario.
+    """
+    r = pd.Series(serie_diaria).dropna().values
+    if len(r) < H + paso:
+        return np.array([]), np.array([]), np.array([])
+
+    rv_l, rs_l, rk_l = [], [], []
+    for fin in range(H, len(r) + 1, paso):
+        w = r[fin - H:fin]
+        rv = float(np.sum(w ** 2))
+        if rv <= 0 or not np.isfinite(rv):
+            continue
+        rs = float(np.sum(w ** 3) / rv ** 1.5)
+        kurt_d = float(H * np.sum(w ** 4) / rv ** 2)
+        rk = 3.0 + (kurt_d - 3.0) / H
+        if not (np.isfinite(rs) and np.isfinite(rk)):
+            continue
+        rv_l.append(rv); rs_l.append(rs); rk_l.append(rk)
+    return np.array(rv_l), np.array(rs_l), np.array(rk_l)
+
+
+def winsorizar(x, p=WINSOR_MOMENTOS):
+    """Winsorizacion simetrica: acota outliers sin descartar observaciones."""
+    if len(x) == 0 or p <= 0:
+        return x
+    lo, hi = np.quantile(x, [p, 1 - p])
+    return np.clip(x, lo, hi)
+
+
+def _nw_lags(T, H=H_VENTANA, paso=PASO_VENTANA_ROLLING):
+    """Rezagos Newey-West. Como minimo el solapamiento mecanico H/paso."""
+    if NW_LAGS_AUTO:
+        L = int(np.floor(4 * (max(T, 2) / 100.0) ** (2.0 / 9.0)))
+    else:
+        L = NW_LAGS_FIJOS
+    L_solape = int(np.ceil(H / max(paso, 1))) - 1
+    return int(max(1, min(max(L, L_solape), max(1, T - 2))))
+
+
+def media_hac(x):
+    """Media muestral y error estandar robusto a heterocedasticidad y
+    autocorrelacion (Newey-West / Bartlett). Necesario porque las ventanas
+    rodantes se solapan y por tanto estan fuertemente autocorrelacionadas."""
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    T = len(x)
+    if T == 0:
+        return np.nan, np.nan, 0
+    if T == 1:
+        return float(x[0]), np.nan, 1
+
+    L = _nw_lags(T)
+    if HAY_STATSMODELS:
+        try:
+            mod = sm.OLS(x, np.ones(T)).fit(cov_type="HAC",
+                                            cov_kwds=dict(maxlags=L, use_correction=True))
+            return float(mod.params[0]), float(mod.bse[0]), T
+        except Exception:
+            pass
+
+    mu = float(np.mean(x))
+    e = x - mu
+    S = float(np.dot(e, e) / T)
+    for l in range(1, L + 1):
+        S += 2.0 * (1.0 - l / (L + 1.0)) * float(np.dot(e[l:], e[:-l]) / T)
+    return mu, float(np.sqrt(max(S, 1e-18) / T)), T
+
+
+filas_roll = []
+for tk in tickers:
+    rv, rs, rk = momentos_realizados_rolling(retornos_dia[tk])
+    if len(rv) < MIN_VENTANAS_ROLLING:
+        filas_roll.append(dict(ticker=tk, n_ventanas=len(rv),
+                               RV_med=float(Sigma_hist_df.loc[tk, tk]), RV_se=np.nan,
+                               RS_roll=0.0, RK_roll=3.0))
+        continue
+    rv, rs, rk = winsorizar(rv), winsorizar(rs), winsorizar(rk)
+    rv_m, rv_se, _ = media_hac(rv)
+    rs_m, _, _ = media_hac(rs)
+    rk_m, _, _ = media_hac(rk)
+    filas_roll.append(dict(ticker=tk, n_ventanas=len(rv),
+                           RV_med=rv_m, RV_se=rv_se, RS_roll=rs_m, RK_roll=rk_m))
+
+rolling = pd.DataFrame(filas_roll).set_index("ticker").loc[tickers]
+
+# -----------------------------------------------------------------------------
+# 1D.1b  Estimador bootstrap de la distribucion a H dias (primario)
+# -----------------------------------------------------------------------------
+
+def momentos_horizonte_bootstrap(R, H, n_rep=N_REP_BOOTSTRAP_MOM,
+                                 J_rep=J_POR_REPLICA_MOM, rng=None):
+    """Momentos fisicos del retorno a H dias y su error estandar.
+
+    Estimador PRIMARIO de la asimetria y la curtosis fisicas: los bloques
+    preservan la agrupacion de volatilidad y los saltos, de modo que la
+    distribucion a H dias no converge artificialmente a la normal como si
+    ocurre bajo la agregacion iid de las ventanas rodantes.
+
+    Cada replica genera J_rep trayectorias por bootstrap estacionario y calcula
+    varianza, asimetria y curtosis de la distribucion agregada. La media entre
+    replicas es el estimador puntual; la desviacion estandar entre replicas es
+    el error estandar (variabilidad de remuestreo).
+    """
+    rng = rng_global if rng is None else rng
+    n_ = R.shape[1]
+    var_r = np.empty((n_rep, n_)); sk_r = np.empty((n_rep, n_)); ku_r = np.empty((n_rep, n_))
+    for m in range(n_rep):
+        Xb = bootstrap_estacionario(R, J_rep, H, BOOTSTRAP_BLOQUE, peso_tiempo, rng)
+        c = Xb - Xb.mean(axis=0)
+        v = (c ** 2).mean(axis=0)
+        sd = np.sqrt(np.maximum(v, 1e-18))
+        var_r[m] = v
+        sk_r[m] = (c ** 3).mean(axis=0) / sd ** 3
+        ku_r[m] = (c ** 4).mean(axis=0) / sd ** 4
+    return (var_r.mean(0), var_r.std(0, ddof=1),
+            sk_r.mean(0), sk_r.std(0, ddof=1),
+            ku_r.mean(0), ku_r.std(0, ddof=1))
+
+
+print(f"\nEstimando momentos fisicos a {H_VENTANA} dias por bootstrap estacionario "
+      f"({N_REP_BOOTSTRAP_MOM} replicas x {J_POR_REPLICA_MOM} trayectorias)...")
+
+(var_bs, var_bs_se, skew_bs, skew_bs_se,
+ kurt_bs, kurt_bs_se) = momentos_horizonte_bootstrap(R_dia, H_VENTANA)
+
+# Varianza fisica: se usa la varianza realizada rodante (estimador exacto y sin
+# supuestos) y su error estandar HAC; el bootstrap sirve de contraste.
+var_P_est = rolling["RV_med"].values.copy()
+var_P_se = np.where(np.isfinite(rolling["RV_se"].values), rolling["RV_se"].values,
+                    var_bs_se)
+var_P_se = np.where(var_P_se > 0, var_P_se, 0.10 * var_P_est + 1e-10)
+
+skew_P_est, skew_P_se = skew_bs, np.maximum(skew_bs_se, 1e-4)
+kurt_P_est, kurt_P_se = kurt_bs, np.maximum(kurt_bs_se, 1e-4)
+
+print("\n=== Momentos fisicos estimados al horizonte ===")
+print(pd.DataFrame({
+    "Var_P": np.round(var_P_est, 5), "se": np.round(var_P_se, 5),
+    "Var_P_bootstrap": np.round(var_bs, 5),
+    "Skew_P": np.round(skew_P_est, 3), "se_S": np.round(skew_P_se, 3),
+    "Skew_iid_roll": np.round(rolling["RS_roll"].values, 3),
+    "Kurt_P": np.round(kurt_P_est, 3), "se_K": np.round(kurt_P_se, 3),
+    "Kurt_iid_roll": np.round(rolling["RK_roll"].values, 3),
+}, index=tickers).to_string())
+print("  (las columnas *_iid_roll son el estimador de ventanas rodantes bajo "
+      "agregacion iid;\n   convergen mecanicamente a 0 y 3 al crecer H y por eso "
+      "no se usan como estimador primario)")
+
+# -----------------------------------------------------------------------------
+# 1D.2  Regresion de calibracion Mincer-Zarnowitz -> primas de riesgo
+# -----------------------------------------------------------------------------
+
+MFIV_vec = np.array([bkm_moments[t]["MFIV"] for t in tickers], dtype=float)
+for i, tk in enumerate(tickers):
+    if not np.isfinite(MFIV_vec[i]) or MFIV_vec[i] <= 0:
+        MFIV_vec[i] = float(Sigma.iloc[i, i])   # varianza implicita ATM como sustituto
+
+
+def mincer_zarnowitz(y, x, se_y, nombre, dominio=None, piso=None):
+    """WLS de y (momento fisico) sobre x (momento implicito), pesos 1/se_y^2.
+
+    Regresion de calibracion en la seccion transversal de los n activos:
+
+        Momento_fisico_i = a + b * Momento_implicito_i + u_i,   w_i = 1/se_i^2
+
+    El pronostico fisico es el valor ajustado y la prima de riesgo del momento
+    es el residuo estructural entre el implicito y ese pronostico:
+
+        VRP_i = MFIV_i - (a_V + b_V * MFIV_i),   idem SRP y KRP
+
+    No es circular, a diferencia de restar la media realizada -- que devolveria
+    el propio momento realizado y destruiria la informacion prospectiva de la
+    superficie: b conserva la dispersion transversal de las opciones y a y
+    (1 - b) corrigen el sesgo.
+
+    `piso` activa la version MULTIPLICATIVA del modelo. La varianza y la
+    curtosis estan acotadas por abajo (var > 0, kurt >= 1), de modo que una
+    prima ADITIVA puede empujar el pronostico fuera del dominio: restar una
+    prima media de 2.5 a una curtosis implicita de 3.5 daria 1.0, inadmisible.
+    Con `piso` la regresion se corre en logaritmos del exceso sobre esa cota,
+
+        log(y - piso) = a + b * log(x - piso) + u
+
+    y se retransforma con el estimador de smearing de Duan, E[exp(u)], que
+    corrige el sesgo de Jensen al volver a niveles. El pronostico resultante
+    respeta el dominio por construccion. La asimetria, que no esta acotada, se
+    estima en niveles.
+
+    Si la pendiente no es informativa se degrada al modelo restringido b = 1
+    (prima constante, de nivel o de escala segun el caso); si el momento
+    implicito no tiene dispersion, a la media ponderada.
+    """
+    y_orig = np.asarray(y, float); x_orig = np.asarray(x, float)
+    se_orig = np.asarray(se_y, float)
+    w = 1.0 / np.maximum(se_orig, 1e-12) ** 2
+    w = w / w.mean()
+
+    log_mode = piso is not None
+    if log_mode:
+        eps = 1e-6
+        y = np.log(np.maximum(y_orig - piso, eps))
+        x = np.log(np.maximum(x_orig - piso, eps))
+        # delta method: se(log y) = se(y) / (y - piso)
+        se_y = se_orig / np.maximum(y_orig - piso, eps)
+    else:
+        y, x, se_y = y_orig, x_orig, se_orig
+
+    def a_nivel(fit_log, resid=None):
+        """Retransformacion con smearing de Duan."""
+        smear = float(np.mean(np.exp(resid))) if resid is not None else 1.0
+        return piso + np.exp(fit_log) * smear
+
+    if np.std(x) < 1e-12 or len(y) < 4:
+        ajuste = np.full_like(y, float(np.average(y, weights=w)))
+        if log_mode:
+            ajuste = a_nivel(ajuste, y - np.average(y, weights=w))
+        if dominio is not None:
+            ajuste = np.clip(ajuste, dominio[0], dominio[1])
+        return dict(fit=ajuste, se_fit=se_orig, a=np.nan, b=np.nan,
+                    t_b=np.nan, r2=np.nan, modelo="media_ponderada", nombre=nombre)
+
+    Xr = np.column_stack([np.ones_like(x), x])
+    if HAY_STATSMODELS:
+        mod = sm.WLS(y, Xr, weights=w).fit(cov_type="HC3")
+        a, b = float(mod.params[0]), float(mod.params[1])
+        se_b = float(mod.bse[1])
+        r2 = float(mod.rsquared)
+        se_media = np.sqrt(np.maximum(
+            np.sum((Xr @ mod.cov_params()) * Xr, axis=1), 0.0))
+    else:
+        W = np.diag(w)
+        XtWX_inv = np.linalg.pinv(Xr.T @ W @ Xr)
+        beta = XtWX_inv @ (Xr.T @ W @ y)
+        a, b = float(beta[0]), float(beta[1])
+        resid = y - Xr @ beta
+        s2 = float(resid @ (w * resid) / max(len(y) - 2, 1))
+        V = s2 * XtWX_inv
+        se_b = float(np.sqrt(max(V[1, 1], 0.0)))
+        sst = float(np.sum(w * (y - np.average(y, weights=w)) ** 2))
+        r2 = 1.0 - float(np.sum(w * resid ** 2)) / max(sst, 1e-18)
+        se_media = np.sqrt(np.maximum(np.sum((Xr @ V) * Xr, axis=1), 0.0))
+
+    t_b = b / se_b if se_b > 0 else np.nan
+
+    # Criterio de degradacion: la pendiente debe ser informativa y de signo y
+    # magnitud economicamente admisibles.
+    usable = (np.isfinite(t_b) and abs(t_b) >= 1.0 and 0.02 <= b <= 3.0)
+    if usable:
+        ajuste_lin = a + b * x
+        resid = y - ajuste_lin
+        modelo = "mincer_zarnowitz" + ("_log" if log_mode else "")
+    else:
+        # Restriccion b = 1: prima constante (de nivel, o de escala en logs)
+        prima_nivel = float(np.average(x - y, weights=w))
+        ajuste_lin = x - prima_nivel
+        resid = y - ajuste_lin
+        se_media = np.full_like(x, float(np.sqrt(
+            np.average(resid ** 2, weights=w) / len(x))))
+        modelo = ("escala_constante(b=1)" if log_mode else "nivel_constante(b=1)")
+
+    # Error estandar en la escala de estimacion, antes de retransformar
+    se_pred_esc = np.sqrt(se_media ** 2 + np.asarray(se_y, float) ** 2)
+
+    if log_mode:
+        ajuste = a_nivel(ajuste_lin, resid)
+        # delta method inverso: se(nivel) = (nivel - piso) * se(log)
+        se_fit = np.maximum(ajuste - piso, 1e-12) * se_pred_esc
+    else:
+        ajuste = ajuste_lin
+        se_fit = se_pred_esc
+
+    # Guardarrail final de dominio (normalmente inactivo en modo logaritmico)
+    if dominio is not None:
+        ajuste = np.clip(ajuste, dominio[0], dominio[1])
+
+    return dict(fit=ajuste, se_fit=se_fit, a=a, b=b, t_b=t_b, r2=r2,
+                modelo=modelo, nombre=nombre)
+
+
+# Varianza y curtosis: modelo multiplicativo (dominio acotado por abajo).
+# Asimetria: modelo aditivo en niveles (no acotada, cambia de signo).
+reg_V = mincer_zarnowitz(var_P_est, MFIV_vec, var_P_se, "Varianza",
+                         dominio=(1e-8, np.inf), piso=0.0)
+reg_S = mincer_zarnowitz(skew_P_est, MFIS_vec, skew_P_se, "Asimetria",
+                         dominio=COTA_SKEW_P)
+reg_K = mincer_zarnowitz(kurt_P_est, MFIK_vec, kurt_P_se, "Curtosis",
+                         dominio=COTA_KURT_P, piso=1.0)
+
+print("\n=== Regresiones de calibracion Mincer-Zarnowitz (seccion transversal, "
+      f"n = {n} activos, WLS) ===")
+print(pd.DataFrame([
+    dict(Momento=r["nombre"], Modelo=r["modelo"],
+         a=round(r["a"], 4) if np.isfinite(r["a"]) else np.nan,
+         b=round(r["b"], 4) if np.isfinite(r["b"]) else np.nan,
+         t_b=round(r["t_b"], 2) if np.isfinite(r["t_b"]) else np.nan,
+         R2=round(r["r2"], 3) if np.isfinite(r["r2"]) else np.nan)
+    for r in (reg_V, reg_S, reg_K)
+]).to_string(index=False))
+print("  (b < 1 => el momento implicito sobre-reacciona respecto del fisico, "
+      "que es el patron documentado)")
+
+# --- Pronosticos fisicos y primas de riesgo ---------------------------------
+var_P = reg_V["fit"].copy()
+skew_P = reg_S["fit"].copy()
+kurt_P = reg_K["fit"].copy()
+
+se_var_P, se_skew_P, se_kurt_P = reg_V["se_fit"], reg_S["se_fit"], reg_K["se_fit"]
+
+VRP = MFIV_vec - var_P          # prima de riesgo de varianza
+SRP = MFIS_vec - skew_P         # prima de riesgo de asimetria
+KRP = MFIK_vec - kurt_P         # prima de riesgo de curtosis
+
+t_VRP = VRP / np.maximum(se_var_P, 1e-12)
+t_SRP = SRP / np.maximum(se_skew_P, 1e-12)
+t_KRP = KRP / np.maximum(se_kurt_P, 1e-12)
+
+print("\n=== Primas de riesgo de momentos (Q - P) al horizonte de "
+      f"{MESES_HORIZONTE} meses ===")
+print(pd.DataFrame({
+    "MFIV_Q": np.round(MFIV_vec, 5), "Var_P_fit": np.round(var_P, 5),
+    "VRP": np.round(VRP, 5), "t_VRP": np.round(t_VRP, 2),
+    "MFIS_Q": np.round(MFIS_vec, 3), "Skew_P_fit": np.round(skew_P, 3),
+    "SRP": np.round(SRP, 3), "t_SRP": np.round(t_SRP, 2),
+    "MFIK_Q": np.round(MFIK_vec, 3), "Kurt_P_fit": np.round(kurt_P, 3),
+    "KRP": np.round(KRP, 3), "t_KRP": np.round(t_KRP, 2),
+}, index=tickers).to_string())
+
+print(f"\n  VRP medio: {np.nanmean(VRP):+.5f}  "
+      "(> 0 = la varianza implicita excede a la fisica, el signo esperado)")
+print(f"  SRP medio: {np.nanmean(SRP):+.4f}  "
+      "(< 0 = la asimetria implicita es mas negativa que la fisica)")
+print(f"  KRP medio: {np.nanmean(KRP):+.4f}  "
+      "(> 0 = la curtosis implicita excede a la fisica)")
+
+# -----------------------------------------------------------------------------
+# 1D.3  Cotas de sensatez y cumulantes fisicos
+# -----------------------------------------------------------------------------
+
+ratio_vol = np.sqrt(np.maximum(var_P, 1e-12) / np.maximum(MFIV_vec, 1e-12))
+n_clip_vol = int(np.sum((ratio_vol < COTA_RATIO_VOL_P[0]) | (ratio_vol > COTA_RATIO_VOL_P[1])))
+ratio_vol = np.clip(ratio_vol, *COTA_RATIO_VOL_P)
+var_P = ratio_vol ** 2 * MFIV_vec
+
+n_clip_skew = int(np.sum((skew_P < COTA_SKEW_P[0]) | (skew_P > COTA_SKEW_P[1])))
+skew_P = np.clip(skew_P, *COTA_SKEW_P)
+n_clip_kurt = int(np.sum((kurt_P < COTA_KURT_P[0]) | (kurt_P > COTA_KURT_P[1])))
+kurt_P = np.clip(kurt_P, *COTA_KURT_P)
+# Cota de factibilidad de Pearson: toda distribucion cumple kurt >= skew^2 + 1
+kurt_P = np.maximum(kurt_P, skew_P ** 2 + 1.05)
+
+if n_clip_vol or n_clip_skew or n_clip_kurt:
+    print(f"\n  Cotas de sensatez activadas -> vol: {n_clip_vol} | "
+          f"skew: {n_clip_skew} | kurt: {n_clip_kurt} activos")
+
+sigma_P_vec = np.sqrt(var_P)
+
+# Cumulantes centrados del log-retorno al horizonte
+k2_P = var_P
+k3_P = skew_P * sigma_P_vec ** 3
+k4_P = (kurt_P - 3.0) * sigma_P_vec ** 4
+
+k2_Q_obs = MFIV_vec
+k3_Q_obs = MFIS_vec * MFIV_vec ** 1.5
+k4_Q_obs = (MFIK_vec - 3.0) * MFIV_vec ** 2
+
+# Errores estandar de los cumulantes (delta method de primer orden)
+se_k2_vec = np.maximum(se_var_P, 1e-10)
+se_k3_vec = np.maximum(se_skew_P * sigma_P_vec ** 3, 1e-12)
+se_k4_vec = np.maximum(se_kurt_P * sigma_P_vec ** 4, 1e-14)
+
+
+# -----------------------------------------------------------------------------
+# 1D.4  Covarianza bajo la medida fisica P
+# -----------------------------------------------------------------------------
+
+D_P = np.diag(sigma_P_vec)
+Sigma_P = pd.DataFrame(D_P @ Corr_hist @ D_P, index=tickers, columns=tickers)
+
+print(f"\n  Sigma_P construida. Vol media Q: {np.mean(np.sqrt(MFIV_vec)):.4f} | "
+      f"vol media P: {np.mean(sigma_P_vec):.4f} | "
+      f"reduccion: {(1 - np.mean(sigma_P_vec) / np.mean(np.sqrt(MFIV_vec))) * 100:.1f}%")
+
+
+# =============================================================================
 # BLOQUE 2: MARKET CAPS VIA YAHOO FINANCE -> w_mkt
 # =============================================================================
 
@@ -613,11 +1156,179 @@ print(f"Delta de mercado (fijo): {delta_mkt:.4f} | Tau (t): {tau} | "
 # BLOQUE 4: RETORNOS DE EQUILIBRIO pi - CAPM INVERTIDO
 # =============================================================================
 
-Sigma_mat = Sigma.values
+# Se usa Sigma_P (medida fisica), no Sigma (risk-neutral, sobreestima el riesgo).
+Sigma_mat = Sigma_P.values
 pi_eq = delta_mkt * (Sigma_mat @ w_mkt)
 
 print("\n=== Retornos de equilibrio pi (prior) ===")
 print(pd.Series(np.round(pi_eq, 4), index=tickers))
+
+
+# =============================================================================
+# BLOQUE 4B: PROYECCION Q -> P POR TRANSFORMADA DE ESSCHER
+# -----------------------------------------------------------------------------
+# Cierra el paso Q -> P: estima el parametro de Esscher theta por GMM anclado a
+# la aversion al riesgo implicita del mercado, y descompone la prima de riesgo
+# del activo en su parte gaussiana (ya recogida por pi_eq) y la no gaussiana
+# (prima_HM), que es la que ajustara Q y Omega en el Bloque 6B.
+# =============================================================================
+
+print("\n" + "=" * 79)
+print("BLOQUE 4B: PROYECCION Q -> P (TRANSFORMADA DE ESSCHER)")
+print("=" * 79)
+
+# Si delta_mkt sale negativo (mercado por debajo de Rf en la ventana) no informa
+# sobre la aversion al riesgo: el ancla pasa a 0, la hipotesis nula Q = P.
+theta_ancla = float(np.clip(delta_mkt, THETA_ESSCHER_COTA[0], THETA_ESSCHER_COTA[1]))
+print(f"\n  delta_mkt (aversion al riesgo implicita del mercado): {delta_mkt:.3f}")
+if not (THETA_ESSCHER_COTA[0] <= delta_mkt <= THETA_ESSCHER_COTA[1]):
+    print(f"  Aviso: delta_mkt fuera del rango admisible {THETA_ESSCHER_COTA}; "
+          f"el ancla se fija en {theta_ancla:.3f}"
+          + (" (hipotesis nula Q = P)" if theta_ancla == 0.0 else ""))
+print(f"  Ancla de theta: {theta_ancla:.3f} | rango admisible: "
+      f"{THETA_ESSCHER_COTA} | difusion del ancla: {THETA_PRIOR_CV:.0%}")
+# -----------------------------------------------------------------------------
+# 4B.1  Transformada de Esscher: estimacion de theta por GMM anclado
+# -----------------------------------------------------------------------------
+
+def cumulantes_Q_desde_P(theta, k2p, k3p, k4p):
+    """k_n^Q = sum_m k_{n+m}^P (-theta)^m / m!, truncado en el 4.o cumulante."""
+    return (k2p - theta * k3p + 0.5 * theta ** 2 * k4p,
+            k3p - theta * k4p)
+
+
+def estimar_theta_esscher(k2p, k3p, k4p, k2q, k3q, se_k2, se_k3,
+                          ancla=None, cv_ancla=THETA_PRIOR_CV):
+    """GMM ponderado y anclado de un parametro sobre dos condiciones de momento.
+
+        min_theta  w2*(k2_Q(th) - k2q)^2 + w3*(k3_Q(th) - k3q)^2
+                   + wa*(th - ancla)^2
+
+    w2, w3 = inversa de la varianza estimada de cada prima (GMM eficiente de
+    dos etapas simplificado). wa = 1/(cv_ancla*ancla)^2 reescalado a la misma
+    unidad que las otras condiciones; su papel es identificar theta cuando
+    k4_P ~ 0 vuelve plana la condicion del 3.er cumulante. Devuelve
+    (theta, en_cota, J) donde J es el residuo GMM normalizado de las dos
+    condiciones de momento (diagnostico de sobre-identificacion).
+    """
+    ancla = theta_ancla if ancla is None else ancla
+    w2 = 1.0 / max(se_k2 ** 2, 1e-20)
+    w3 = 1.0 / max(se_k3 ** 2, 1e-20)
+    esc = w2 + w3
+    w2, w3 = w2 / esc, w3 / esc
+
+    # Escala del ancla, en las mismas unidades que el objetivo GMM (k2q^2
+    # normaliza). Con ancla ~ 0 el prior debe ser DIFUSO, no estrecho: de ahi
+    # el piso de medio rango admisible.
+    rango = THETA_ESSCHER_COTA[1] - THETA_ESSCHER_COTA[0]
+    sd_ancla = cv_ancla * max(abs(ancla), 0.5 * rango)
+    wa = (k2q ** 2) / sd_ancla ** 2
+
+    def objetivo(th):
+        th = float(np.atleast_1d(th)[0])
+        c2, c3 = cumulantes_Q_desde_P(th, k2p, k3p, k4p)
+        return (w2 * (c2 - k2q) ** 2 + w3 * (c3 - k3q) ** 2
+                + wa * (th - ancla) ** 2)
+
+    rejilla = np.linspace(THETA_ESSCHER_COTA[0], THETA_ESSCHER_COTA[1], 251)
+    th0 = float(rejilla[int(np.argmin([objetivo(t) for t in rejilla]))])
+    res = minimize(objetivo, np.array([th0]), method="L-BFGS-B",
+                   bounds=[THETA_ESSCHER_COTA])
+    th = float(res.x[0]) if res.success else th0
+
+    c2, c3 = cumulantes_Q_desde_P(th, k2p, k3p, k4p)
+    J = float(w2 * (c2 - k2q) ** 2 + w3 * (c3 - k3q) ** 2)
+    en_cota = bool(abs(th - THETA_ESSCHER_COTA[0]) < 1e-6
+                   or abs(th - THETA_ESSCHER_COTA[1]) < 1e-6)
+    return th, en_cota, J
+
+
+def primas_esscher(theta, k2p, k3p, k4p):
+    """Descomposicion de la prima total k1_P - k1_Q.
+
+        total    = theta*k2 - theta^2/2*k3 + theta^3/6*k4
+        gaussian = theta*k2                        <- ya recogida por pi_eq
+        HM       = -theta^2/2*k3 + theta^3/6*k4    <- componente no gaussiana
+    """
+    gauss = theta * k2p
+    hm = -0.5 * theta ** 2 * k3p + (theta ** 3 / 6.0) * k4p
+    return gauss + hm, gauss, hm
+
+
+theta_esscher = np.zeros(n); en_cota = np.zeros(n, dtype=bool); J_gmm = np.zeros(n)
+prima_total = np.zeros(n); prima_gauss = np.zeros(n); prima_hm = np.zeros(n)
+
+for i in range(n):
+    theta_esscher[i], en_cota[i], J_gmm[i] = estimar_theta_esscher(
+        k2_P[i], k3_P[i], k4_P[i], k2_Q_obs[i], k3_Q_obs[i],
+        se_k2_vec[i], se_k3_vec[i])
+    prima_total[i], prima_gauss[i], prima_hm[i] = primas_esscher(
+        theta_esscher[i], k2_P[i], k3_P[i], k4_P[i])
+
+# Cota economica sobre la prima no gaussiana: no puede exceder una fraccion
+# razonable de la volatilidad fisica del activo. Es un guardarrail (se informa
+# cuando actua), no un parametro de calibracion.
+tope_hm = MAX_PRIMA_HM_SIGMA * sigma_P_vec
+n_topados = int(np.sum(np.abs(prima_hm) > tope_hm))
+prima_hm = np.clip(prima_hm, -tope_hm, tope_hm)
+
+# -----------------------------------------------------------------------------
+# 4B.2  Incertidumbre de la prima no gaussiana (alimenta Omega)
+# -----------------------------------------------------------------------------
+# prima_HM es funcion no lineal de los momentos estimados: su error estandar se
+# propaga por delta-method de Monte Carlo.
+
+se_prima_hm = np.zeros(n)
+for i in range(n):
+    v_d = var_P[i] + se_var_P[i] * rng_global.standard_normal(N_MC_DELTA)
+    s_d = skew_P[i] + se_skew_P[i] * rng_global.standard_normal(N_MC_DELTA)
+    k_d = kurt_P[i] + se_kurt_P[i] * rng_global.standard_normal(N_MC_DELTA)
+    draws = np.empty(N_MC_DELTA)
+    for m in range(N_MC_DELTA):
+        v_p = float(np.clip(v_d[m], (COTA_RATIO_VOL_P[0] ** 2) * MFIV_vec[i],
+                            (COTA_RATIO_VOL_P[1] ** 2) * MFIV_vec[i]))
+        s_p = float(np.clip(s_d[m], *COTA_SKEW_P))
+        k_p = max(float(np.clip(k_d[m], *COTA_KURT_P)), s_p ** 2 + 1.05)
+        sd = math.sqrt(v_p)
+        c2, c3, c4 = v_p, s_p * sd ** 3, (k_p - 3.0) * sd ** 4
+        th, _, _ = estimar_theta_esscher(c2, c3, c4, MFIV_vec[i], k3_Q_obs[i],
+                                         se_k2_vec[i], se_k3_vec[i])
+        draws[m] = np.clip(primas_esscher(th, c2, c3, c4)[2],
+                           -tope_hm[i], tope_hm[i])
+    se_prima_hm[i] = float(np.std(draws, ddof=1))
+
+print("\n=== Proyeccion Q -> P y descomposicion de la prima de riesgo ===")
+print("(prima_gauss ya esta recogida en pi_eq via el CAPM invertido; "
+      "prima_HM es el termino no gaussiano que ajusta Q)")
+print(pd.DataFrame({
+    "sigma_Q": np.round(np.sqrt(MFIV_vec), 4),
+    "sigma_P": np.round(sigma_P_vec, 4),
+    "skew_Q": np.round(MFIS_vec, 3), "skew_P": np.round(skew_P, 3),
+    "kurt_Q": np.round(MFIK_vec, 3), "kurt_P": np.round(kurt_P, 3),
+    "theta": np.round(theta_esscher, 3),
+    "prima_gauss": np.round(prima_gauss, 4),
+    "prima_HM": np.round(prima_hm, 4),
+    "se_HM": np.round(se_prima_hm, 4),
+    "t_HM": np.round(prima_hm / np.maximum(se_prima_hm, 1e-10), 2),
+    "J_gmm": np.round(J_gmm, 4),
+}, index=tickers).to_string())
+print("  (J_gmm = residuo de sobre-identificacion: valores altos indican que el "
+      "truncamiento\n   en el 4.o cumulante no logra reconciliar Q y P para ese "
+      "activo)")
+
+n_cota_sup = int(np.sum(theta_esscher >= THETA_ESSCHER_COTA[1] - 1e-6))
+if n_cota_sup:
+    print(f"  Aviso: theta alcanzo su cota SUPERIOR en {n_cota_sup} activos "
+          f"(rango admitido {THETA_ESSCHER_COTA}); bajo truncamiento en el 4.o "
+          "cumulante la reconciliacion Q-P de esos activos es solo parcial.")
+if float(np.mean(theta_esscher)) < 1e-3:
+    print("  Nota: theta ~ 0 en todo el universo => no se detecta prima de "
+          "momentos superiores y el modelo se reduce, correctamente, al "
+          "Black-Litterman gaussiano estandar.")
+if n_topados:
+    print(f"  Aviso: prima_HM topada en {n_topados} activos por la cota economica "
+          f"de {MAX_PRIMA_HM_SIGMA:.0%} de sigma_P.")
+
 
 # =============================================================================
 # BLOQUE 5: TABLA DE REFERENCIA PARA VIEWS
@@ -669,290 +1380,958 @@ Q = pd.Series({
 print("\n=== Vector Q (magnitudes del gestor) ===")
 print(Q.round(4))
 
-# --- PASO 4: Omega (automatico - no editar) ---------------------------------
+# =============================================================================
+# BLOQUE 6B: PUENTE Q -> P SOBRE (Q, Omega) + NUCLEO GAUSSIANO BL
+# -----------------------------------------------------------------------------
+# Sustituye el parche de KAPPA_SKEW / KAPPA_KURT. Q se corrige con la prima no
+# gaussiana del Bloque 4B y Omega suma dos fuentes ortogonales: el riesgo de
+# mercado de las vistas y la incertidumbre de estimacion de esa prima. Con
+# ambos se calcula el posterior gaussiano (mu_BL, Sigma_BL).
+# =============================================================================
+
 P_mat = P.values
 Q_vec = Q.values.reshape(-1, 1)
-
-Omega_base = np.diag(np.diag(tau * P_mat @ Sigma_mat @ P_mat.T))
-Omega = Omega_base * perfil["omega_scale"]
-
-print(f"\n=== Matriz Omega (incertidumbre de views - perfil: {PERFIL_RIESGO}) ===")
-print(pd.DataFrame(Omega, index=P.index, columns=P.index).round(6))
-
-# =============================================================================
-# BLOQUE 6B: BRIDGE BKM -> BLACK-LITTERMAN (Q, Omega, mu_BL, Sigma_BL)
-# =============================================================================
-
-KAPPA_SKEW = 0.15
-KAPPA_KURT = 0.20
-KURT_BASELINE = 3.0
-
 pi_eq_col = pi_eq.reshape(-1, 1)
 tauSigma = tau * Sigma_mat
 
-# --- Ajuste de Q por asimetria negativa -------------------------------------
-exposicion_skew_view = P_mat @ MFIS_vec
-penalizacion_skew = KAPPA_SKEW * np.minimum(0.0, exposicion_skew_view)
-Q_adjusted = Q.values + penalizacion_skew
+# --- (i) Q bajo la medida fisica --------------------------------------------
+ajuste_Q_hm = P_mat @ prima_hm
+Q_P = Q.values + ajuste_Q_hm
 
-print("\n=== Ajuste de Q por asimetria implicita negativa ===")
+print("\n" + "=" * 79)
+print("BLOQUE 6B: PUENTE ECONOMETRICO Q -> P")
+print("=" * 79)
+print("\n=== Ajuste vectorial de Q por prima de riesgo no gaussiana ===")
 print(pd.DataFrame({
-    "Q_original": Q.values,
-    "Exposicion_MFIS": np.round(exposicion_skew_view, 4),
-    "Penalizacion": np.round(penalizacion_skew, 4),
-    "Q_adjusted": np.round(Q_adjusted, 4),
-}, index=Q.index))
+    "Q_riesgo_neutral": np.round(Q.values, 4),
+    "P.prima_HM": np.round(ajuste_Q_hm, 4),
+    "Q_fisico": np.round(Q_P, 4),
+}, index=Q.index).to_string())
 
-# --- Ajuste de Omega por exceso de curtosis ---------------------------------
-exceso_kurt_vec = np.maximum(0.0, MFIK_vec - KURT_BASELINE)
-exposicion_kurt_view = np.abs(P_mat) @ exceso_kurt_vec
-factor_omega = 1.0 + KAPPA_KURT * exposicion_kurt_view
-Omega_adjusted = np.diag(np.diag(Omega) * factor_omega)
+# --- (ii) Omega bajo la medida fisica ---------------------------------------
+Omega_mercado = np.diag(np.diag(tau * P_mat @ Sigma_mat @ P_mat.T)) * perfil["omega_scale"]
+# Varianza de estimacion de la prima no gaussiana proyectada al espacio de views
+Var_prima = np.diag(se_prima_hm ** 2)
+Omega_estimacion = np.diag(np.diag(P_mat @ Var_prima @ P_mat.T))
+Omega_P = Omega_mercado + Omega_estimacion
 
-print("\n=== Ajuste de Omega por exceso de curtosis implicita ===")
+print("\n=== Descomposicion de Omega (varianzas, no desviaciones) ===")
 print(pd.DataFrame({
-    "Omega_original": np.diag(Omega),
-    "Exceso_MFIK_view": np.round(exposicion_kurt_view, 4),
-    "Factor_escala": np.round(factor_omega, 4),
-    "Omega_adjusted": np.diag(Omega_adjusted),
-}, index=Q.index))
+    "Riesgo_mercado": np.diag(Omega_mercado),
+    "Riesgo_estimacion": np.diag(Omega_estimacion),
+    "Omega_total": np.diag(Omega_P),
+    "%_estimacion": np.round(100 * np.diag(Omega_estimacion) /
+                             np.maximum(np.diag(Omega_P), 1e-18), 1),
+}, index=Q.index).to_string())
 
-# --- Actualizacion bayesiana con Q_adjusted / Omega_adjusted ----------------
-Q_adj_col = Q_adjusted.reshape(-1, 1)
-sorpresa_adj = Q_adj_col - P_mat @ pi_eq_col
-M_adj = P_mat @ tauSigma @ P_mat.T + Omega_adjusted
-M_adj_inv = np.linalg.inv(M_adj)
-ajuste_adj = tauSigma @ P_mat.T @ M_adj_inv @ sorpresa_adj
-mu_BL_adj = pi_eq_col + ajuste_adj
-
-# --- Sigma_BL posterior formal -----------------------------------------------
-Sigma_BL = Sigma_mat + tauSigma - tauSigma @ P_mat.T @ M_adj_inv @ P_mat @ tauSigma
+# --- Nucleo gaussiano de Black-Litterman ------------------------------------
+# mu_BL    = pi + tau*Sigma*P' (P tau Sigma P' + Omega)^-1 (Q_P - P pi)
+# Sigma_BL = Sigma + [tau*Sigma - tau*Sigma P' M^-1 P tau*Sigma]
+# Solo aporta los dos primeros momentos; el Bloque 7 anade el 3.o y el 4.o.
+Q_P_col = Q_P.reshape(-1, 1)
+sorpresa = Q_P_col - P_mat @ pi_eq_col
+M_bl = P_mat @ tauSigma @ P_mat.T + Omega_P
+M_bl_inv = np.linalg.inv(M_bl)
+mu_BL = (pi_eq_col + tauSigma @ P_mat.T @ M_bl_inv @ sorpresa).flatten()
+Sigma_BL = Sigma_mat + tauSigma - tauSigma @ P_mat.T @ M_bl_inv @ P_mat @ tauSigma
 Sigma_BL = pd.DataFrame(Sigma_BL, index=tickers, columns=tickers)
 
 comparacion = pd.DataFrame({
     "Ticker": tickers,
     "Pi_eq": np.round(pi_eq, 4),
     "Mu_hist": np.round(mu_historico, 4),
-    "Mu_BL_adj": np.round(mu_BL_adj.flatten(), 4),
+    "Prima_HM": np.round(prima_hm, 4),
+    "Mu_BL": np.round(mu_BL, 4),
 })
-comparacion["Ajuste_BL"] = np.round(comparacion["Mu_BL_adj"] - comparacion["Pi_eq"], 4)
+comparacion["Ajuste_BL"] = np.round(comparacion["Mu_BL"] - comparacion["Pi_eq"], 4)
 
-print("\n=== Comparacion: pi vs Historico vs mu_BL_adj (con ajuste BKM) ===")
+print("\n=== Posterior gaussiano: pi vs historico vs mu_BL ===")
 print(comparacion.to_string(index=False))
-
-print(f"\nSigma_BL calculada. Norma Frobenius |Sigma_BL - Sigma|: "
+print(f"\nNorma Frobenius |Sigma_BL - Sigma_P|: "
       f"{np.linalg.norm(Sigma_BL.values - Sigma_mat):.6f}")
 
 # =============================================================================
-# BLOQUE 8B: OPTIMIZACION MEAN-VARIANCE-SKEWNESS-KURTOSIS (MVSK)
+# BLOQUE 7: INTEGRACION BAYESIANA NO GAUSSIANA
+# -----------------------------------------------------------------------------
+# El posterior del Bloque 6B es gaussiano: solo tiene media y covarianza. Aqui
+# se sustituye por una distribucion DISCRETA sobre un panel de escenarios cuyos
+# momentos 1 a 4 coinciden con los del modelo, por Entropy Pooling de Meucci
+# (opcion A) o por inclinacion de Gram-Charlier / Edgeworth (opcion B, que
+# ademas actua de fallback).
 # =============================================================================
 
-from scipy.optimize import minimize as scipy_minimize
+from scipy.special import logsumexp
 
-LAMBDA3 = 1.0
-LAMBDA4 = 1.0
+print("\n" + "=" * 79)
+print("BLOQUE 7: POSTERIOR NO GAUSSIANO")
+print("=" * 79)
 
+# -----------------------------------------------------------------------------
+# 7.1  Panel de escenarios prior (bootstrap estacionario, funcion del Bloque 1D)
+# -----------------------------------------------------------------------------
 
-def construir_tensores_comomento(retornos, sigma_diag_bkm, mfis_bkm, mfik_bkm):
-    X = retornos.values - retornos.values.mean(axis=0)
-    T_obs, n_ = X.shape
+print(f"\nGenerando panel de {N_ESCENARIOS} escenarios "
+      f"(bootstrap estacionario, bloque medio {BOOTSTRAP_BLOQUE} dias, "
+      f"half-life {HALF_LIFE_PRIOR} dias)...")
 
-    M3 = np.zeros((n_, n_ * n_))
-    M4 = np.zeros((n_, n_ * n_ * n_))
+X_raw = bootstrap_estacionario(R_dia, N_ESCENARIOS, horizonte_dias,
+                               BOOTSTRAP_BLOQUE, peso_tiempo, rng_global)
 
-    for i in range(n_):
-        for j in range(n_):
-            for k in range(n_):
-                M3[i, j * n_ + k] = np.mean(X[:, i] * X[:, j] * X[:, k])
+# Reescalado afin por columna hacia (pi_eq, sigma_P): no altera la correlacion
+# del panel ni la asimetria/curtosis que aporta el bootstrap.
+mu_raw = X_raw.mean(axis=0)
+sd_raw = X_raw.std(axis=0, ddof=1)
+sd_raw = np.where(sd_raw > 0, sd_raw, 1.0)
+X_prior = (X_raw - mu_raw) / sd_raw * sigma_P_vec + pi_eq
 
-    for i in range(n_):
-        for j in range(n_):
-            for k in range(n_):
-                for l in range(n_):
-                    M4[i, j * n_ * n_ + k * n_ + l] = np.mean(X[:, i] * X[:, j] * X[:, k] * X[:, l])
+f_prior = np.full(N_ESCENARIOS, 1.0 / N_ESCENARIOS)
 
-    for i in range(n_):
-        if np.isfinite(mfis_bkm[i]):
-            M3[i, i * n_ + i] = mfis_bkm[i] * sigma_diag_bkm[i] ** 3
-        if np.isfinite(mfik_bkm[i]):
-            M4[i, i * n_ * n_ + i * n_ + i] = mfik_bkm[i] * sigma_diag_bkm[i] ** 4
-
-    return M3, M4
+print(f"  Panel listo: {X_prior.shape[0]} x {X_prior.shape[1]}")
+print(f"  Asimetria media del prior:  {pd.DataFrame(X_prior).skew().mean():+.3f}")
+print(f"  Curtosis media del prior:   {pd.DataFrame(X_prior).kurt().mean() + 3:.3f}")
 
 
-def portfolio_skew(w, M3):
-    kron_ww = np.kron(w, w)
-    return float(w @ M3 @ kron_ww)
+# -----------------------------------------------------------------------------
+# 7.2  Utilidades de momentos ponderados
+# -----------------------------------------------------------------------------
+
+def momentos_ponderados(X, p):
+    """Media, covarianza, asimetria y curtosis estandarizadas por activo."""
+    mu = p @ X
+    Xc = X - mu
+    Sig = (Xc * p[:, None]).T @ Xc
+    sd = np.sqrt(np.maximum(np.diag(Sig), 1e-18))
+    sk = (p @ (Xc ** 3)) / sd ** 3
+    ku = (p @ (Xc ** 4)) / sd ** 4
+    return mu, Sig, sk, ku
 
 
-def portfolio_kurt(w, M4):
-    kron_www = np.kron(np.kron(w, w), w)
-    return float(w @ M4 @ kron_www)
+def momentos_portafolio(w, X, p):
+    """Momentos centrales del retorno del portafolio bajo (X, p).
+
+    Equivale a w'mu, w'Sigma w, w'M3(w x w) y w'M4(w x w x w) pero se calcula
+    en O(J*n) en vez de construir tensores de co-momentos de tamano n^3 y n^4.
+    """
+    r = X @ w
+    mu = float(p @ r)
+    d = r - mu
+    m2 = float(p @ d ** 2)
+    m3 = float(p @ d ** 3)
+    m4 = float(p @ d ** 4)
+    return mu, m2, m3, m4
 
 
-def utilidad_mvsk_negativa(w, mu, Sigma_arr, M3, M4, gamma, lam3, lam4):
-    ret = w @ mu
-    var = w @ Sigma_arr @ w
-    skew = portfolio_skew(w, M3)
-    kurt = portfolio_kurt(w, M4)
-    utilidad = ret - (gamma / 2) * var + (lam3 / 3) * skew - (lam4 / 4) * kurt
-    return -utilidad
+# -----------------------------------------------------------------------------
+# 7.3  OPCION A: Entropy Pooling
+# -----------------------------------------------------------------------------
+
+def entropy_pooling(f, A, b, tol_residuo=1e-6, maxiter=800):
+    """Posterior de minima entropia relativa sujeto a E_p[A] = b.
+
+    Parametros
+    ----------
+    f : (J,)   probabilidades prior
+    A : (K, J) matriz de features (una fila por restriccion de momento)
+    b : (K,)   valores objetivo
+
+    Devuelve (p, info). El problema dual es
+        min_lambda  log sum_j f_j exp(-lambda' V_j),  V = (A - b) / escala
+    convexo y sin restricciones; su gradiente es -E_p[V], de modo que el optimo
+    satisface exactamente las restricciones cuando son factibles.
+    """
+    K, J = A.shape
+    escala = A.std(axis=1, ddof=1)
+    escala = np.where(escala > 1e-14, escala, 1.0)
+    V = (A - b[:, None]) / escala[:, None]
+    log_f = np.log(np.maximum(f, 1e-300))
+
+    def dual(lam):
+        z = log_f - lam @ V
+        lse = logsumexp(z)
+        p = np.exp(z - lse)
+        return float(lse), -(V @ p)
+
+    res = minimize(dual, np.zeros(K), jac=True, method="L-BFGS-B",
+                   options=dict(maxiter=maxiter, ftol=1e-14, gtol=1e-10))
+
+    lam = res.x
+    z = log_f - lam @ V
+    p = np.exp(z - logsumexp(z))
+    p = np.maximum(p, 0.0)
+    p = p / p.sum()
+
+    residuo = np.abs(V @ p)
+    kl = float(np.sum(p * (np.log(np.maximum(p, 1e-300)) - log_f)))
+    ens = float(np.exp(-np.sum(p * np.log(np.maximum(p, 1e-300)))) / J)
+
+    info = dict(exito=bool(res.success), kl=kl, ens=ens,
+                residuo_max=float(residuo.max()),
+                factible=bool(residuo.max() < max(tol_residuo, 1e-4)),
+                lam=lam, mensaje=str(res.message))
+    return p, info
 
 
-sigma_diag_para_bkm = np.sqrt(np.diag(Sigma_BL.values))
+def construir_restricciones(X, mu_obj, var_obj, skew_obj, kurt_obj, nivel):
+    """Bloques de restricciones por nivel de momento.
 
-print("\n=== Construyendo tensores de co-skewness / co-kurtosis ===")
-M3, M4 = construir_tensores_comomento(retornos_sem[tickers], sigma_diag_para_bkm, MFIS_vec, MFIK_vec)
-print(f"M3 shape: {M3.shape} | M4 shape: {M4.shape}")
+    nivel = 2 -> media y varianza
+    nivel = 3 -> + asimetria
+    nivel = 4 -> + curtosis
+    """
+    filas, objetivos, etiquetas = [], [], []
+    sd_obj = np.sqrt(var_obj)
 
-mu_opt = mu_BL_adj.flatten()
-Sigma_opt = Sigma_BL.values
+    for i in range(X.shape[1]):
+        filas.append(X[:, i]); objetivos.append(mu_obj[i]); etiquetas.append(f"mean_{i}")
+    for i in range(X.shape[1]):
+        filas.append((X[:, i] - mu_obj[i]) ** 2); objetivos.append(var_obj[i])
+        etiquetas.append(f"var_{i}")
+    if nivel >= 3:
+        for i in range(X.shape[1]):
+            filas.append((X[:, i] - mu_obj[i]) ** 3)
+            objetivos.append(skew_obj[i] * sd_obj[i] ** 3)
+            etiquetas.append(f"skew_{i}")
+    if nivel >= 4:
+        for i in range(X.shape[1]):
+            filas.append((X[:, i] - mu_obj[i]) ** 4)
+            objetivos.append(kurt_obj[i] * sd_obj[i] ** 4)
+            etiquetas.append(f"kurt_{i}")
 
-w0 = np.ones(n) / n
-bounds = [(0.0, 1.0)] * n
-constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
+    return np.array(filas), np.array(objetivos), etiquetas
 
-resultado_mvsk = scipy_minimize(
-    utilidad_mvsk_negativa, w0,
-    args=(mu_opt, Sigma_opt, M3, M4, gamma_ra, LAMBDA3, LAMBDA4),
-    method="SLSQP", bounds=bounds, constraints=constraints,
-    options=dict(maxiter=500, ftol=1e-10),
-)
 
-if not resultado_mvsk.success:
-    print(f"  Aviso: el optimizador SLSQP no convergio limpiamente ({resultado_mvsk.message})")
+# --- Objetivos de momento extraidos del modelo -------------------------------
+# Momentos 1 y 2: posterior gaussiano de Black-Litterman (Bloque 6B).
+# Momentos 3 y 4: proyeccion a P de los momentos BKM (Bloque 1D).
+mu_obj = mu_BL.copy()
+var_obj = np.diag(Sigma_BL.values).copy()
+skew_obj = skew_P.copy()
+kurt_obj = kurt_P.copy()
 
-w_mvsk = resultado_mvsk.x.copy()
-w_mvsk[w_mvsk < UMBRAL_PESO_MIN] = 0
-w_mvsk = w_mvsk / w_mvsk.sum()
 
-if np.sum(w_mvsk > 0) > MAX_TICKERS_FINAL:
-    idx_top = np.argsort(w_mvsk)[::-1][:MAX_TICKERS_FINAL]
-    w_final = np.zeros(n)
-    w_final[idx_top] = w_mvsk[idx_top]
-    w_mvsk = w_final / w_final.sum()
+# -----------------------------------------------------------------------------
+# 7.4  OPCION B: inclinacion de Gram-Charlier / Edgeworth
+# -----------------------------------------------------------------------------
 
-w_mvsk = pd.Series(w_mvsk, index=tickers)
+def he3(z):
+    return z ** 3 - 3 * z
 
-print("\n=== Pesos optimos - Portafolio MVSK (BL + BKM) ===")
-print(w_mvsk[w_mvsk > 0].round(4))
+
+def he4(z):
+    return z ** 4 - 6 * z ** 2 + 3
+
+
+def gram_charlier_pdf_ratio(z, s, k):
+    """g(z)/phi(z) = 1 + (S/6) He_3(z) + ((K-3)/24) He_4(z).
+
+    Serie tipo A truncada en el 4.o momento. Puede volverse negativa fuera de
+    la region de validez de Barton-Dennis, por lo que se trunca por abajo.
+    """
+    return 1.0 + (s / 6.0) * he3(z) + ((k - 3.0) / 24.0) * he4(z)
+
+
+def posterior_gram_charlier(X, f, mu_obj, var_obj, skew_obj, kurt_obj):
+    """Reponderacion del panel por el factor de Gram-Charlier activo a activo.
+
+    Es el analogo por muestreo de importancia de expandir la densidad posterior
+    del vector de retornos en serie de Edgeworth alrededor de la normal
+    N(mu_BL, Sigma_BL) sumando las contribuciones del 3.er y 4.o momento BKM.
+    """
+    Z = (X - mu_obj) / np.sqrt(var_obj)
+    log_w = np.zeros(X.shape[0])
+    for i in range(X.shape[1]):
+        ratio = gram_charlier_pdf_ratio(Z[:, i], skew_obj[i], kurt_obj[i])
+        log_w += np.log(np.maximum(ratio, 1e-6))
+    log_p = np.log(np.maximum(f, 1e-300)) + log_w
+    p = np.exp(log_p - logsumexp(log_p))
+    p = p / p.sum()
+    ens = float(np.exp(-np.sum(p * np.log(np.maximum(p, 1e-300)))) / len(p))
+    kl = float(np.sum(p * (np.log(np.maximum(p, 1e-300)) - np.log(np.maximum(f, 1e-300)))))
+    negativos = int(np.sum(gram_charlier_pdf_ratio(Z, skew_obj, kurt_obj) < 0))
+    return p, dict(exito=True, kl=kl, ens=ens, residuo_max=np.nan,
+                   factible=True, densidades_negativas=negativos,
+                   mensaje="gram_charlier")
+
+
+# -----------------------------------------------------------------------------
+# 7.5  Resolucion con degradacion controlada
+# -----------------------------------------------------------------------------
+
+metodo_posterior_usado = None
+info_post = None
+
+if METODO_POSTERIOR == "entropy_pooling":
+    niveles = [4, 3, 2] if EP_IMPONER_CURTOSIS else [3, 2]
+    nombres_nivel = {4: "media+var+skew+kurt", 3: "media+var+skew", 2: "media+var"}
+
+    for niv in niveles:
+        A_ep, b_ep, _ = construir_restricciones(
+            X_prior, mu_obj, var_obj, skew_obj, kurt_obj, niv)
+        print(f"\n  Entropy Pooling nivel {niv} ({nombres_nivel[niv]}): "
+              f"{A_ep.shape[0]} restricciones sobre {N_ESCENARIOS} escenarios...")
+        p_post, info = entropy_pooling(f_prior, A_ep, b_ep)
+        print(f"    exito={info['exito']} | residuo_max={info['residuo_max']:.2e} | "
+              f"KL={info['kl']:.4f} | ENS={info['ens'] * 100:.1f}% de J")
+        if info["factible"] and info["ens"] >= EP_TOL_ENS:
+            metodo_posterior_usado = f"entropy_pooling_n{niv}"
+            info_post = info
+            break
+        print("    -> rechazado (infactible o ENS demasiado bajo); se relaja un nivel")
+
+    if metodo_posterior_usado is None:
+        print("\n  Entropy Pooling no alcanzo una solucion aceptable. "
+              "Se recurre a la expansion de Gram-Charlier (Opcion B).")
+        p_post, info_post = posterior_gram_charlier(
+            X_prior, f_prior, mu_obj, var_obj, skew_obj, kurt_obj)
+        metodo_posterior_usado = "gram_charlier_fallback"
+else:
+    p_post, info_post = posterior_gram_charlier(
+        X_prior, f_prior, mu_obj, var_obj, skew_obj, kurt_obj)
+    metodo_posterior_usado = "gram_charlier"
+    print(f"\n  Gram-Charlier: KL={info_post['kl']:.4f} | "
+          f"ENS={info_post['ens'] * 100:.1f}% de J | "
+          f"celdas con densidad negativa truncadas: "
+          f"{info_post.get('densidades_negativas', 0)}")
+
+# -----------------------------------------------------------------------------
+# 7.6  Momentos del posterior no gaussiano
+# -----------------------------------------------------------------------------
+
+mu_post, Sigma_post_arr, skew_post, kurt_post = momentos_ponderados(X_prior, p_post)
+Sigma_post = pd.DataFrame(Sigma_post_arr, index=tickers, columns=tickers)
+
+print(f"\n=== Posterior obtenido por: {metodo_posterior_usado} ===")
+print(f"  Entropia relativa D(p||f): {info_post['kl']:.4f} nats")
+print(f"  Numero efectivo de escenarios: {info_post['ens'] * 100:.1f}% de {N_ESCENARIOS}")
+
+tabla_post = pd.DataFrame({
+    "mu_BL_obj": np.round(mu_obj, 4),
+    "mu_post": np.round(mu_post, 4),
+    "sd_obj": np.round(np.sqrt(var_obj), 4),
+    "sd_post": np.round(np.sqrt(np.diag(Sigma_post_arr)), 4),
+    "skew_obj": np.round(skew_obj, 3),
+    "skew_post": np.round(skew_post, 3),
+    "kurt_obj": np.round(kurt_obj, 3),
+    "kurt_post": np.round(kurt_post, 3),
+}, index=tickers)
+
+print("\n=== Ajuste del posterior a los momentos objetivo ===")
+print(tabla_post.to_string())
 
 # =============================================================================
-# BLOQUE 9: METRICAS DEL PORTAFOLIO
+# BLOQUE 7B: MODULO DE RIESGO DE COLA (VaR, CVaR / EXPECTED SHORTFALL)
+# -----------------------------------------------------------------------------
+# VaR historico, gaussiano y ajustado por Cornish-Fisher; CVaR / Expected
+# Shortfall en version historica exacta y Cornish-Fisher; y ratios ajustados
+# por cola (Sortino y Omega). Todo se evalua sobre distribuciones ponderadas,
+# para poder aplicarlo tal cual al posterior del Bloque 7.
+# =============================================================================
+
+def _pesos_normalizados(m, probabilidades):
+    if probabilidades is None:
+        return np.full(m, 1.0 / m)
+    p = np.asarray(probabilidades, dtype=float)
+    return p / p.sum()
+
+
+def var_cvar_historico(perdidas, p, alpha):
+    """VaR y CVaR exactos de una distribucion discreta ponderada de perdidas.
+
+    ES_alpha = 1/(1-alpha) * [ sum_{L>q} p_i L_i + (1-alpha - sum_{L>q} p_i) q ]
+    (formula exacta que reparte correctamente la masa del propio cuantil).
+    """
+    orden = np.argsort(perdidas)
+    L = perdidas[orden]
+    w = p[orden]
+    acum = np.cumsum(w)
+    idx = int(np.searchsorted(acum, alpha, side="left"))
+    idx = min(idx, len(L) - 1)
+    var = float(L[idx])
+
+    cola = L > var
+    masa_cola = float(w[cola].sum())
+    suma_cola = float(np.sum(w[cola] * L[cola]))
+    resto = max(1.0 - alpha - masa_cola, 0.0)
+    cvar = (suma_cola + resto * var) / (1.0 - alpha)
+    return var, float(cvar)
+
+
+def cornish_fisher_z(alpha_cola, s, k):
+    """Cuantil de Cornish-Fisher para la probabilidad de cola alpha_cola.
+
+    Inversa de la expansion de Gram-Charlier / Edgeworth: corrige el cuantil
+    normal z con la asimetria S y la curtosis K del portafolio,
+
+        z_CF = z + (z^2-1)S/6 + (z^3-3z)(K-3)/24 - (2z^3-5z)S^2/36
+
+    de modo que VaR = -(mu + sigma*z_CF) recoge la forma real de la cola y no
+    la normal implicita del VaR parametrico clasico.
+    """
+    z = norm.ppf(alpha_cola)
+    ex = k - 3.0
+    return (z
+            + (z ** 2 - 1.0) * s / 6.0
+            + (z ** 3 - 3.0 * z) * ex / 24.0
+            - (2.0 * z ** 3 - 5.0 * z) * s ** 2 / 36.0)
+
+
+def var_cvar_cornish_fisher(mu, sigma, s, k, alpha, n_grid=2000):
+    """VaR y CVaR bajo la distribucion implicita por Cornish-Fisher.
+
+    El CVaR se obtiene integrando el cuantil CF sobre la cola izquierda:
+        ES = -( mu + sigma * (1/(1-alpha)) * integral_0^{1-alpha} z_CF(u) du )
+    """
+    z_cf = cornish_fisher_z(1.0 - alpha, s, k)
+    var = -(mu + sigma * z_cf)
+
+    u = np.linspace(1e-6, 1.0 - alpha, n_grid)
+    z_u = cornish_fisher_z(u, s, k)
+    media_cola = float(_trapz(z_u, u) / (1.0 - alpha))
+    cvar = -(mu + sigma * media_cola)
+    return float(var), float(cvar)
+
+
+def calcular_metricas_riesgo_cola(w, retornos_df, nivel_confianza=0.95,
+                                  probabilidades=None, rf_periodo=0.0,
+                                  umbral_omega=None, etiqueta=""):
+    """Metricas de riesgo de cola de un portafolio.
+
+    Parametros
+    ----------
+    w : array (n,) o pd.Series
+        Pesos del portafolio.
+    retornos_df : pd.DataFrame (m x n) o np.ndarray
+        Panel de retornos por activo al horizonte de analisis. Puede ser la
+        serie historica realizada o el panel de escenarios del posterior.
+    nivel_confianza : float
+        Nivel del VaR principal (por defecto 0.95).
+    probabilidades : array (m,), opcional
+        Probabilidades de cada fila. None => equiponderadas. Permite evaluar
+        directamente el posterior de Entropy Pooling.
+    rf_periodo : float
+        Tasa libre de riesgo del periodo; sirve de MAR para el Sortino.
+    umbral_omega : float, opcional
+        Umbral tau del Omega ratio. None => UMBRAL_OMEGA_RATIO.
+
+    Devuelve
+    --------
+    pd.Series con VaR historico y Cornish-Fisher, CVaR historico y CF a los
+    niveles de NIVELES_CVAR, Sortino, Omega y estadisticos de apoyo.
+
+        Sortino = (E[r] - MAR) / sqrt(E[min(r - MAR, 0)^2])
+        Omega   = E[(r - tau)+] / E[(tau - r)+]
+    """
+    if isinstance(w, pd.Series):
+        w_arr = w.values.astype(float)
+    else:
+        w_arr = np.asarray(w, dtype=float)
+
+    X = retornos_df.values if isinstance(retornos_df, pd.DataFrame) else np.asarray(retornos_df)
+    if X.shape[1] != len(w_arr):
+        raise ValueError(f"Dimension incompatible: X tiene {X.shape[1]} activos "
+                         f"y w tiene {len(w_arr)}")
+
+    p = _pesos_normalizados(X.shape[0], probabilidades)
+    r = X @ w_arr
+
+    mu = float(p @ r)
+    d = r - mu
+    m2 = float(p @ d ** 2)
+    sigma = math.sqrt(max(m2, 1e-18))
+    s_std = float(p @ d ** 3) / sigma ** 3
+    k_std = float(p @ d ** 4) / sigma ** 4
+
+    perdidas = -r
+    tau_omega = UMBRAL_OMEGA_RATIO if umbral_omega is None else umbral_omega
+
+    out = {"Retorno_esperado": mu, "Volatilidad": sigma,
+           "Skewness": s_std, "Kurtosis": k_std}
+
+    # --- VaR al nivel principal ---------------------------------------------
+    var_h, cvar_h = var_cvar_historico(perdidas, p, nivel_confianza)
+    var_cf, cvar_cf = var_cvar_cornish_fisher(mu, sigma, s_std, k_std, nivel_confianza)
+    var_gauss = -(mu + sigma * norm.ppf(1.0 - nivel_confianza))
+    nc = int(round(nivel_confianza * 100))
+    out[f"VaR{nc}_historico"] = var_h
+    out[f"VaR{nc}_gaussiano"] = var_gauss
+    out[f"VaR{nc}_CornishFisher"] = var_cf
+
+    # --- CVaR / Expected Shortfall a los niveles solicitados ----------------
+    for a in NIVELES_CVAR:
+        v_h, c_h = var_cvar_historico(perdidas, p, a)
+        _, c_cf = var_cvar_cornish_fisher(mu, sigma, s_std, k_std, a)
+        na = int(round(a * 100))
+        out[f"CVaR{na}_historico"] = c_h
+        out[f"CVaR{na}_CornishFisher"] = c_cf
+
+    # --- Ratios ajustados por riesgo de cola --------------------------------
+    exceso_mar = r - rf_periodo
+    downside = np.sqrt(float(p @ np.minimum(exceso_mar, 0.0) ** 2))
+    out["Sortino"] = float((mu - rf_periodo) / downside) if downside > 1e-12 else np.nan
+
+    ganancia = float(p @ np.maximum(r - tau_omega, 0.0))
+    perdida = float(p @ np.maximum(tau_omega - r, 0.0))
+    out["Omega"] = float(ganancia / perdida) if perdida > 1e-12 else np.inf
+
+    # --- Apoyo ---------------------------------------------------------------
+    out["Sharpe"] = float((mu - rf_periodo) / sigma) if sigma > 1e-12 else np.nan
+    out["Prob_perdida"] = float(p[r < 0].sum())
+    out["Peor_escenario"] = float(r.min())
+
+    return pd.Series(out, name=etiqueta if etiqueta else None)
+
+# =============================================================================
+# BLOQUE 8B: OPTIMIZACION - MODO MVSK O MODO CVaR
+# -----------------------------------------------------------------------------
+# Dos modos seleccionables con MODO_OPTIMIZACION, ambos sobre el posterior no
+# gaussiano del Bloque 7:
+#   "mvsk"  maximiza la utilidad esperada por expansion de Taylor de 4.o orden.
+#   "cvar"  minimiza CVaR_alpha con un retorno esperado minimo, por el programa
+#           lineal de Rockafellar-Uryasev (optimo global).
+# =============================================================================
+
+print("\n" + "=" * 79)
+print(f"BLOQUE 8B: OPTIMIZACION (modo = {MODO_OPTIMIZACION.upper()})")
+print("=" * 79)
+
+mu_opt = mu_post.copy()
+
+
+def utilidad_mvsk_negativa(w, X, p, gamma, lam3, lam4):
+    """-U(w) con U = E[r] - (g/2)m2 + (l3/3)m3 - (l4/4)m4."""
+    mu_w, m2, m3, m4 = momentos_portafolio(w, X, p)
+    return -(mu_w - (gamma / 2.0) * m2 + (lam3 / 3.0) * m3 - (lam4 / 4.0) * m4)
+
+
+def optimizar_mvsk(X, p, gamma, lam3, lam4, activos_permitidos=None, w_ini=None):
+    n_ = X.shape[1]
+    if activos_permitidos is None:
+        activos_permitidos = np.ones(n_, dtype=bool)
+    bounds = [(0.0, PESO_MAX_ACTIVO) if activos_permitidos[i] else (0.0, 0.0)
+              for i in range(n_)]
+    if w_ini is None:
+        w_ini = activos_permitidos.astype(float)
+        w_ini = w_ini / w_ini.sum()
+    cons = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
+    res = minimize(utilidad_mvsk_negativa, w_ini, args=(X, p, gamma, lam3, lam4),
+                   method="SLSQP", bounds=bounds, constraints=cons,
+                   options=dict(maxiter=600, ftol=1e-11))
+    if not res.success:
+        print(f"  Aviso SLSQP: {res.message}")
+    w = np.clip(res.x, 0.0, None)
+    return w / w.sum(), res
+
+
+def optimizar_min_cvar(X, p, alpha, retorno_min, mu_vec,
+                       activos_permitidos=None, max_escenarios=MAX_ESCENARIOS_LP,
+                       rng=None):
+    """LP de Rockafellar-Uryasev. Devuelve (w, info).
+
+        min_{w, zeta, u}   zeta + 1/((1-alpha) M) sum_j u_j
+        s.a.  u_j >= -x_j'w - zeta,  u_j >= 0
+              mu'w >= retorno_min,  sum w = 1,  0 <= w <= w_max
+
+    El optimo en zeta es el propio VaR_alpha y el valor objetivo es el CVaR.
+    Al ser un programa lineal el optimo es global, sin la convergencia local
+    de SLSQP.
+
+    El panel se remuestrea por importancia con probabilidades p para que el LP
+    trabaje con escenarios equiponderados de tamano manejable sin sesgar la
+    distribucion posterior.
+    """
+    rng = rng_global if rng is None else rng
+    J_, n_ = X.shape
+    if activos_permitidos is None:
+        activos_permitidos = np.ones(n_, dtype=bool)
+
+    if J_ > max_escenarios:
+        idx = rng.choice(J_, size=max_escenarios, replace=True, p=p)
+        Xs = X[idx]
+    else:
+        # Remuestreo tambien aqui para poder usar pesos uniformes en el LP
+        idx = rng.choice(J_, size=J_, replace=True, p=p)
+        Xs = X[idx]
+    M = Xs.shape[0]
+
+    # z = [w (n_), zeta (1), u (M)]
+    c = np.concatenate([np.zeros(n_), [1.0], np.full(M, 1.0 / ((1.0 - alpha) * M))])
+
+    # -x_j'w - zeta - u_j <= 0
+    A1 = sparse.hstack([
+        sparse.csr_matrix(-Xs),
+        sparse.csr_matrix(-np.ones((M, 1))),
+        -sparse.identity(M, format="csr"),
+    ], format="csr")
+    b1 = np.zeros(M)
+
+    # -mu'w <= -retorno_min
+    A2 = sparse.csr_matrix(
+        np.concatenate([-mu_vec, [0.0], np.zeros(M)]).reshape(1, -1))
+    b2 = np.array([-retorno_min])
+
+    A_ub = sparse.vstack([A1, A2], format="csr")
+    b_ub = np.concatenate([b1, b2])
+
+    A_eq = sparse.csr_matrix(
+        np.concatenate([np.ones(n_), [0.0], np.zeros(M)]).reshape(1, -1))
+    b_eq = np.array([1.0])
+
+    bounds = ([(0.0, PESO_MAX_ACTIVO) if activos_permitidos[i] else (0.0, 0.0)
+               for i in range(n_)]
+              + [(None, None)]
+              + [(0.0, None)] * M)
+
+    res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
+                  bounds=bounds, method="highs")
+
+    if not res.success:
+        return None, dict(exito=False, mensaje=res.message)
+
+    w = np.clip(res.x[:n_], 0.0, None)
+    w = w / w.sum()
+    return w, dict(exito=True, cvar=float(res.fun), var=float(res.x[n_]),
+                   mensaje=res.message, n_escenarios=M)
+
+
+def aplicar_limites_cartera(w, umbral=UMBRAL_PESO_MIN, max_activos=MAX_TICKERS_FINAL):
+    """Umbral de peso minimo + cardinalidad maxima. Devuelve la mascara final."""
+    mask = w >= umbral
+    if mask.sum() == 0:
+        mask = np.zeros_like(w, dtype=bool)
+        mask[int(np.argmax(w))] = True
+    if mask.sum() > max_activos:
+        idx_top = np.argsort(np.where(mask, w, -np.inf))[::-1][:max_activos]
+        mask = np.zeros_like(w, dtype=bool)
+        mask[idx_top] = True
+    return mask
+
+
+# --- Retorno minimo exigido en modo CVaR ------------------------------------
+retorno_min_efectivo = (float(w_mkt @ mu_opt) if RETORNO_MIN_CVAR is None
+                        else float(RETORNO_MIN_CVAR))
+
+# --- Primera pasada ---------------------------------------------------------
+if MODO_OPTIMIZACION == "cvar":
+    print(f"\n  Minimizando CVaR_{ALPHA_CVAR_OBJETIVO:.0%} con "
+          f"E[r] >= {retorno_min_efectivo:.4f} "
+          f"({'benchmark de mercado' if RETORNO_MIN_CVAR is None else 'fijado por el usuario'})")
+    w_bruto, info_opt = optimizar_min_cvar(
+        X_prior, p_post, ALPHA_CVAR_OBJETIVO, retorno_min_efectivo, mu_opt)
+    if w_bruto is None:
+        print(f"  LP infactible ({info_opt['mensaje']}). Se recurre al modo MVSK.")
+        w_bruto, info_opt = optimizar_mvsk(X_prior, p_post, gamma_ra, LAMBDA3, LAMBDA4)
+        modo_efectivo = "mvsk (fallback)"
+    else:
+        print(f"  LP resuelto sobre {info_opt['n_escenarios']} escenarios | "
+              f"VaR={info_opt['var']:.4f} | CVaR={info_opt['cvar']:.4f}")
+        modo_efectivo = "cvar"
+else:
+    print(f"\n  Maximizando utilidad MVSK | gamma={gamma_ra} | "
+          f"lambda3={LAMBDA3} | lambda4={LAMBDA4}")
+    w_bruto, info_opt = optimizar_mvsk(X_prior, p_post, gamma_ra, LAMBDA3, LAMBDA4)
+    modo_efectivo = "mvsk"
+
+# --- Segunda pasada: re-optimizacion sobre el soporte final -----------------
+# Truncar y renormalizar destruiria la optimalidad: se fija el soporte y se
+# resuelve otra vez el mismo problema restringido a el.
+mask_final = aplicar_limites_cartera(w_bruto)
+print(f"  Soporte final: {int(mask_final.sum())} activos "
+      f"(umbral {UMBRAL_PESO_MIN:.1%}, maximo {MAX_TICKERS_FINAL})")
+
+if modo_efectivo == "cvar":
+    w_re, info_re = optimizar_min_cvar(X_prior, p_post, ALPHA_CVAR_OBJETIVO,
+                                       retorno_min_efectivo, mu_opt,
+                                       activos_permitidos=mask_final)
+    if w_re is None:
+        # El retorno minimo puede ser inalcanzable en el soporte reducido
+        print("  Re-optimizacion CVaR infactible en el soporte reducido; "
+              "se relaja la restriccion de retorno al maximo alcanzable.")
+        r_max_soporte = float(np.max(mu_opt[mask_final]))
+        w_re, info_re = optimizar_min_cvar(X_prior, p_post, ALPHA_CVAR_OBJETIVO,
+                                           min(retorno_min_efectivo, r_max_soporte),
+                                           mu_opt, activos_permitidos=mask_final)
+    w_opt = w_re if w_re is not None else (w_bruto * mask_final) / (w_bruto * mask_final).sum()
+else:
+    w_ini = np.where(mask_final, w_bruto, 0.0)
+    w_ini = w_ini / w_ini.sum()
+    w_opt, _ = optimizar_mvsk(X_prior, p_post, gamma_ra, LAMBDA3, LAMBDA4,
+                              activos_permitidos=mask_final, w_ini=w_ini)
+
+w_opt = np.where(w_opt < 1e-10, 0.0, w_opt)
+w_opt = w_opt / w_opt.sum()
+w_mvsk = pd.Series(w_opt, index=tickers)
+
+print(f"\n=== Pesos optimos - Portafolio BL+BKM ({modo_efectivo.upper()}) ===")
+print(w_mvsk[w_mvsk > 0].sort_values(ascending=False).round(4).to_string())
+
+# =============================================================================
+# BLOQUE 8C: PORTAFOLIO MARKOWITZ TRADICIONAL (CONTROL)
+# -----------------------------------------------------------------------------
+# Media-varianza clasica con insumos 100% historicos: sin Black-Litterman, sin
+# informacion de opciones y sin momentos superiores. Es la referencia contra la
+# que se mide todo lo anterior.
+# =============================================================================
+
+print("\n" + "=" * 79)
+print("BLOQUE 8C: PORTAFOLIO MARKOWITZ TRADICIONAL (CONTROL)")
+print("=" * 79)
+
+
+def markowitz_clasico(mu_vec, Sigma_arr, gamma, w_max=PESO_MAX_ACTIVO):
+    """QP de media-varianza long-only con el MISMO tope por activo que el
+    optimizador del Bloque 8B, para que la comparacion sea justa.
+
+        max_w  mu'w - (gamma/2) w'Sigma w   s.a.  sum w = 1,  0 <= w <= w_max
+
+    quadprog resuelve el QP con restricciones de desigualdad; si falla (matriz
+    no definida positiva, por ejemplo) se recurre a SLSQP.
+    """
+    n_ = len(mu_vec)
+    w_max = min(max(w_max, 1.0 / n_), 1.0)   # el tope debe permitir sum w = 1
+    try:
+        G = gamma * (Sigma_arr + Sigma_arr.T) / 2.0 + np.eye(n_) * 1e-8
+        # Restricciones: sum w = 1 (igualdad), w >= 0, -w >= -w_max
+        Amat = np.column_stack([np.ones(n_), np.eye(n_), -np.eye(n_)])
+        bvec = np.concatenate([[1.0], np.zeros(n_), np.full(n_, -w_max)])
+        w = quadprog.solve_qp(G, mu_vec, Amat, bvec, meq=1)[0]
+        w = np.clip(w, 0.0, None)
+        return w / w.sum()
+    except Exception as e:
+        print(f"  quadprog fallo ({e}); se usa SLSQP")
+        obj = lambda w: -(w @ mu_vec - (gamma / 2.0) * w @ Sigma_arr @ w)
+        res = minimize(obj, np.full(n_, 1.0 / n_), method="SLSQP",
+                       bounds=[(0.0, w_max)] * n_,
+                       constraints=[{"type": "eq", "fun": lambda w: w.sum() - 1.0}])
+        w = np.clip(res.x, 0.0, None)
+        return w / w.sum()
+
+
+w_mkw_bruto = markowitz_clasico(mu_historico, Sigma_hist, gamma_ra)
+mask_mkw = aplicar_limites_cartera(w_mkw_bruto)
+
+# Re-optimizacion sobre el subespacio seleccionado (mismo criterio que en 8B:
+# se resuelve el QP restringido, no se trunca y renormaliza).
+idx_mkw = np.where(mask_mkw)[0]
+w_sub = markowitz_clasico(mu_historico[idx_mkw],
+                          Sigma_hist[np.ix_(idx_mkw, idx_mkw)], gamma_ra)
+w_mkw = np.zeros(n)
+w_mkw[idx_mkw] = w_sub
+w_markowitz = pd.Series(w_mkw, index=tickers)
+
+print("\n=== Pesos - Markowitz tradicional (mu_hist, Sigma_hist) ===")
+print(w_markowitz[w_markowitz > 0].sort_values(ascending=False).round(4).to_string())
+
+# =============================================================================
+# BLOQUE 9: METRICAS COMPARATIVAS DE RIESGO DE COLA
+# -----------------------------------------------------------------------------
+# Compara mercado, Markowitz (control) y BL+BKM sobre dos distribuciones: el
+# posterior del modelo (forward-looking, sobre el que se optimizo) y los
+# retornos historicos realizados al horizonte (validacion fuera del modelo).
 # =============================================================================
 
 etiqueta_horizonte = f"{MESES_HORIZONTE} mes(es)"
 
+print("\n" + "=" * 79)
+print(f"BLOQUE 9: METRICAS DE RIESGO DE COLA ({etiqueta_horizonte})")
+print("=" * 79)
+
+# --- Panel historico de retornos al horizonte (ventanas solapadas) ----------
+ret_hist_horizonte = (retornos_dia[tickers]
+                      .rolling(horizonte_dias)
+                      .sum()
+                      .dropna())
+print(f"\nPanel historico: {len(ret_hist_horizonte)} ventanas solapadas de "
+      f"{horizonte_dias} dias | Panel posterior: {N_ESCENARIOS} escenarios")
+
+portafolios = {
+    "Mercado (w_mkt)": pd.Series(w_mkt, index=tickers),
+    "Markowitz (control)": w_markowitz,
+    f"BL+BKM {modo_efectivo.upper()}": w_mvsk,
+}
+
+# --- (1) Bajo el posterior del modelo ---------------------------------------
+metricas_post = pd.DataFrame({
+    nombre: calcular_metricas_riesgo_cola(
+        w, X_prior, nivel_confianza=NIVEL_CONFIANZA_VAR,
+        probabilidades=p_post, rf_periodo=Rf_h, etiqueta=nombre)
+    for nombre, w in portafolios.items()
+})
+
+# --- (2) Bajo los retornos historicos realizados ----------------------------
+metricas_hist = pd.DataFrame({
+    nombre: calcular_metricas_riesgo_cola(
+        w, ret_hist_horizonte, nivel_confianza=NIVEL_CONFIANZA_VAR,
+        rf_periodo=Rf_h, etiqueta=nombre)
+    for nombre, w in portafolios.items()
+})
+
+nc = int(round(NIVEL_CONFIANZA_VAR * 100))
+orden_filas = [
+    "Retorno_esperado", "Volatilidad", "Skewness", "Kurtosis",
+    f"VaR{nc}_historico", f"VaR{nc}_gaussiano", f"VaR{nc}_CornishFisher",
+] + [f"CVaR{int(round(a * 100))}_historico" for a in NIVELES_CVAR] \
+  + [f"CVaR{int(round(a * 100))}_CornishFisher" for a in NIVELES_CVAR] \
+  + ["Sharpe", "Sortino", "Omega", "Prob_perdida", "Peor_escenario"]
+
+print(f"\n--- (1) Bajo el POSTERIOR del modelo ({metodo_posterior_usado}) ---")
+print(metricas_post.loc[orden_filas].round(4).to_string())
+
+print("\n--- (2) Bajo los RETORNOS HISTORICOS realizados (validacion) ---")
+print(metricas_hist.loc[orden_filas].round(4).to_string())
+
+# --- Lectura del efecto de los momentos superiores --------------------------
+print("\n--- Efecto de los momentos de orden superior sobre el VaR ---")
+print("(VaR_CF - VaR_gaussiano > 0 => la normalidad SUBESTIMA la perdida)")
+brecha = (metricas_post.loc[f"VaR{nc}_CornishFisher"]
+          - metricas_post.loc[f"VaR{nc}_gaussiano"])
+print(pd.DataFrame({
+    f"VaR{nc}_gauss": metricas_post.loc[f"VaR{nc}_gaussiano"].round(4),
+    f"VaR{nc}_CF": metricas_post.loc[f"VaR{nc}_CornishFisher"].round(4),
+    "Brecha": brecha.round(4),
+    "Brecha_%": (100 * brecha / metricas_post.loc[f"VaR{nc}_gaussiano"]).round(1),
+}).to_string())
+
+# --- Variables de compatibilidad para los bloques siguientes ----------------
 w_mvsk_vec = w_mvsk.values
-mu_BL_vec = mu_BL_adj.flatten()
+mu_BL_vec = mu_post.copy()
+ret_port, m2_port, m3_port, m4_port = momentos_portafolio(w_mvsk_vec, X_prior, p_post)
+vol_port = math.sqrt(max(m2_port, 1e-18))
+sharpe_BL = float(metricas_post.loc["Sharpe", f"BL+BKM {modo_efectivo.upper()}"])
+sharpe_mkt = float(metricas_post.loc["Sharpe", "Mercado (w_mkt)"])
+sharpe_mkw = float(metricas_post.loc["Sharpe", "Markowitz (control)"])
 
-ret_port = float(w_mvsk_vec @ mu_BL_vec)
-var_port = float(w_mvsk_vec @ Sigma_opt @ w_mvsk_vec)
-vol_port = math.sqrt(var_port)
-skew_port = portfolio_skew(w_mvsk_vec, M3)
-kurt_port = portfolio_kurt(w_mvsk_vec, M4)
-sharpe_BL = (ret_port - Rf_h) / vol_port
-
-ret_mkt = float(w_mkt @ mu_BL_vec)
-var_mkt = float(w_mkt @ Sigma_opt @ w_mkt)
-vol_mkt = math.sqrt(var_mkt)
-sharpe_mkt = (ret_mkt - Rf_h) / vol_mkt
-
-print(f"\n=== Metricas - Portafolio MVSK ({etiqueta_horizonte}) ===")
-print(f"Retorno esperado:   {ret_port:.4f}")
-print(f"Volatilidad:        {vol_port:.4f}")
-print(f"Skewness:            {skew_port:.6f}")
-print(f"Kurtosis:            {kurt_port:.6f}")
-print(f"Sharpe Ratio:        {sharpe_BL:.4f}")
-print(f"Rf horizonte:        {Rf_h:.4f}")
-
-print(f"\n=== Metricas - Portafolio de mercado ({etiqueta_horizonte}) ===")
-print(f"Retorno esperado:   {ret_mkt:.4f}")
-print(f"Volatilidad:        {vol_mkt:.4f}")
-print(f"Sharpe Ratio:       {sharpe_mkt:.4f}")
+print(f"\n=== Resumen del portafolio BL+BKM ({modo_efectivo.upper()}) ===")
+print(f"  Retorno esperado:  {ret_port:.4f}")
+print(f"  Volatilidad:       {vol_port:.4f}")
+print(f"  Skewness (m3):     {m3_port:.6f}")
+print(f"  Kurtosis (m4):     {m4_port:.6f}")
+print(f"  Sharpe:            {sharpe_BL:.4f}   (mercado: {sharpe_mkt:.4f} | "
+      f"Markowitz: {sharpe_mkw:.4f})")
+print(f"  Rf al horizonte:   {Rf_h:.4f}")
 
 # =============================================================================
 # BLOQUE 10: VISUALIZACION
 # =============================================================================
 
-sharpes_perfiles = {}
-for nm, pf in PERFILES.items():
-    Om_sim = np.diag(np.diag(pf["tau"] * P_mat @ Sigma_mat @ P_mat.T)) * pf["omega_scale"]
-    M_sim = P_mat @ (pf["tau"] * Sigma_mat) @ P_mat.T + Om_sim
-    try:
-        aj_sim = (pf["tau"] * Sigma_mat) @ P_mat.T @ np.linalg.inv(M_sim) @ (Q_adj_col - P_mat @ pi_eq_col)
-        mu_sim = pi_eq_col + aj_sim
-        Dm_sim = pf["gamma_ra"] * Sigma_mat * 2 + np.eye(n) * 1e-10
-        dv_sim = mu_sim.flatten()
-        Amat_sim = np.column_stack([np.ones(n), np.eye(n)])
-        bvec_sim = np.concatenate([[1.0], np.zeros(n)])
-        op_sim = quadprog.solve_qp(Dm_sim, dv_sim, Amat_sim, bvec_sim, meq=1)[0]
-    except Exception:
-        op_sim = w_mkt.copy()
-        mu_sim = mu_BL_vec.reshape(-1, 1)
-    op_sim = np.where(op_sim < UMBRAL_PESO_MIN, 0, op_sim)
-    if op_sim.sum() > 0:
-        op_sim = op_sim / op_sim.sum()
-    r_sim = float(op_sim @ mu_sim.flatten())
-    v_sim = math.sqrt(float(op_sim @ Sigma_mat @ op_sim))
-    sharpes_perfiles[nm] = (r_sim - Rf_h) / v_sim
-
-nombres_perfiles = ["conservador", "moderado", "agresivo"]
-valores_sharpe = [sharpes_perfiles[nm] for nm in nombres_perfiles]
-
 comp_sorted = comparacion.sort_values("Ajuste_BL")
 colores_ajuste = ["#70AD47" if v > 0 else "#ED7D31" for v in comp_sorted["Ajuste_BL"]]
+nombres_port = list(portafolios.keys())
+colores_port = ["#4472C4", "#FFC000", "#70AD47"]
 
 fig = make_subplots(
-    rows=2, cols=2,
+    rows=3, cols=2,
     subplot_titles=(
         f"Retornos esperados - {etiqueta_horizonte}",
-        "Pesos: Mercado vs MVSK",
-        "Sharpe por perfil de riesgo (MV, referencia)",
-        "Ajuste mu_BL_adj vs pi (impacto de views + BKM)",
+        "Pesos: Mercado vs Markowitz vs BL+BKM",
+        f"VaR{nc} y CVaR: gaussiano vs Cornish-Fisher",
+        "Ratios ajustados por riesgo de cola",
+        "Primas de riesgo de momentos (Q - P)",
+        "Ajuste mu_BL vs pi (views + prima no gaussiana)",
     ),
+    vertical_spacing=0.10,
 )
 
-fig.add_trace(go.Bar(x=comparacion["Ticker"], y=comparacion["Pi_eq"], name="pi (Equilibrio)",
-                      marker_color="#4472C4"), row=1, col=1)
+# (1,1) Retornos esperados
+fig.add_trace(go.Bar(x=comparacion["Ticker"], y=comparacion["Pi_eq"], name="pi (equilibrio)",
+                     marker_color="#4472C4"), row=1, col=1)
 fig.add_trace(go.Bar(x=comparacion["Ticker"], y=comparacion["Mu_hist"], name="Historico",
-                      marker_color="#FFC000"), row=1, col=1)
-fig.add_trace(go.Bar(x=comparacion["Ticker"], y=comparacion["Mu_BL_adj"], name="mu_BL_adj (Posterior BKM)",
-                      marker_color="#ED7D31"), row=1, col=1)
+                     marker_color="#FFC000"), row=1, col=1)
+fig.add_trace(go.Bar(x=tickers, y=mu_post, name="mu posterior (no gaussiano)",
+                     marker_color="#ED7D31"), row=1, col=1)
 
-fig.add_trace(go.Bar(x=tickers, y=w_mkt, name="Mercado", marker_color="#4472C4"), row=1, col=2)
-fig.add_trace(go.Bar(x=tickers, y=w_mvsk_vec, name=f"MVSK: {PERFIL_RIESGO.upper()}",
-                      marker_color="#70AD47"), row=1, col=2)
+# (1,2) Pesos
+for nombre, color in zip(nombres_port, colores_port):
+    fig.add_trace(go.Bar(x=tickers, y=portafolios[nombre].values, name=nombre,
+                         marker_color=color, showlegend=True), row=1, col=2)
 
-fig.add_trace(go.Bar(x=["Conservador", "Moderado", "Agresivo"], y=valores_sharpe,
-                      marker_color=["#70AD47", "#FFC000", "#ED7D31"], showlegend=False,
-                      name="Sharpe"), row=2, col=1)
-fig.add_hline(y=sharpe_mkt, line_dash="dash", line_color="#4472C4",
-              annotation_text="Mercado", annotation_position="top left", row=2, col=1)
+# (2,1) VaR / CVaR comparativo
+filas_riesgo = [f"VaR{nc}_gaussiano", f"VaR{nc}_CornishFisher",
+                f"CVaR{int(round(NIVELES_CVAR[0] * 100))}_historico",
+                f"CVaR{int(round(NIVELES_CVAR[-1] * 100))}_historico"]
+etq_riesgo = [f"VaR{nc} gauss", f"VaR{nc} CF",
+              f"CVaR{int(round(NIVELES_CVAR[0] * 100))}",
+              f"CVaR{int(round(NIVELES_CVAR[-1] * 100))}"]
+for nombre, color in zip(nombres_port, colores_port):
+    fig.add_trace(go.Bar(x=etq_riesgo, y=[metricas_post.loc[f, nombre] for f in filas_riesgo],
+                         name=nombre, marker_color=color, showlegend=False), row=2, col=1)
 
-fig.add_trace(go.Bar(x=comp_sorted["Ticker"], y=comp_sorted["Ajuste_BL"], marker_color=colores_ajuste,
-                      showlegend=False, name="Ajuste BL"), row=2, col=2)
-fig.add_hline(y=0, line_color="black", row=2, col=2)
+# (2,2) Sharpe / Sortino / Omega
+for nombre, color in zip(nombres_port, colores_port):
+    fig.add_trace(go.Bar(x=["Sharpe", "Sortino", "Omega"],
+                         y=[metricas_post.loc["Sharpe", nombre],
+                            metricas_post.loc["Sortino", nombre],
+                            metricas_post.loc["Omega", nombre]],
+                         name=nombre, marker_color=color, showlegend=False), row=2, col=2)
 
-fig.update_xaxes(tickangle=90, row=1, col=1)
-fig.update_xaxes(tickangle=90, row=1, col=2)
-fig.update_xaxes(tickangle=90, row=2, col=2)
+# (3,1) Primas de riesgo de momentos
+fig.add_trace(go.Bar(x=tickers, y=VRP, name="VRP", marker_color="#4472C4",
+                     showlegend=False), row=3, col=1)
+fig.add_trace(go.Bar(x=tickers, y=SRP, name="SRP", marker_color="#ED7D31",
+                     showlegend=False), row=3, col=1)
+fig.add_trace(go.Bar(x=tickers, y=KRP / 10.0, name="KRP/10", marker_color="#A5A5A5",
+                     showlegend=False), row=3, col=1)
+
+# (3,2) Ajuste BL
+fig.add_trace(go.Bar(x=comp_sorted["Ticker"], y=comp_sorted["Ajuste_BL"],
+                     marker_color=colores_ajuste, showlegend=False,
+                     name="Ajuste BL"), row=3, col=2)
+fig.add_hline(y=0, line_color="black", row=3, col=2)
+
+for r, c in [(1, 1), (1, 2), (3, 1), (3, 2)]:
+    fig.update_xaxes(tickangle=90, row=r, col=c)
 fig.update_yaxes(title_text="Retorno esperado", row=1, col=1)
 fig.update_yaxes(title_text="Peso", row=1, col=2)
-fig.update_yaxes(title_text="Sharpe Ratio", range=[0, max(valores_sharpe) * 1.3], row=2, col=1)
-fig.update_yaxes(title_text="mu_BL_adj - pi", row=2, col=2)
+fig.update_yaxes(title_text="Perdida", row=2, col=1)
+fig.update_yaxes(title_text="Ratio", row=2, col=2)
+fig.update_yaxes(title_text="Prima (Q - P)", row=3, col=1)
+fig.update_yaxes(title_text="mu_post - pi", row=3, col=2)
 
 fig.update_layout(
-    title=f"Vision General Black-Litterman - {etiqueta_horizonte}",
+    title=(f"Black-Litterman + BKM extendido - {etiqueta_horizonte}<br>"
+           f"<sup>Perfil: {PERFIL_RIESGO.upper()} | Posterior: {metodo_posterior_usado} | "
+           f"Optimizacion: {modo_efectivo.upper()}</sup>"),
     barmode="group",
     template="plotly_white",
-    height=900,
-    legend=dict(orientation="h", yanchor="bottom", y=1.08, xanchor="center", x=0.5),
+    height=1250,
+    legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="center", x=0.5),
 )
 fig.show()
 
+# --- Distribucion posterior del portafolio vs normal ------------------------
+r_port_esc = X_prior @ w_mvsk_vec
+orden_esc = np.argsort(r_port_esc)
+r_ord = r_port_esc[orden_esc]
+p_ord = p_post[orden_esc]
+
+fig2 = go.Figure()
+fig2.add_trace(go.Histogram(x=r_port_esc, histnorm="probability density",
+                            nbinsx=90, name="Posterior (no gaussiano)",
+                            marker_color="#4472C4", opacity=0.55))
+grid = np.linspace(r_ord.min(), r_ord.max(), 400)
+fig2.add_trace(go.Scatter(x=grid,
+                          y=norm.pdf(grid, ret_port, vol_port),
+                          mode="lines", name="Normal(mu, sigma) equivalente",
+                          line=dict(color="#ED7D31", width=2)))
+var_cf_port = metricas_post.loc[f"VaR{nc}_CornishFisher", f"BL+BKM {modo_efectivo.upper()}"]
+cvar_port = metricas_post.loc[f"CVaR{nc}_historico", f"BL+BKM {modo_efectivo.upper()}"]
+fig2.add_vline(x=-var_cf_port, line_dash="dash", line_color="darkorange",
+               annotation_text=f"VaR{nc} CF: {var_cf_port * 100:.2f}%",
+               annotation_position="top left")
+fig2.add_vline(x=-cvar_port, line_dash="dash", line_color="darkred",
+               annotation_text=f"CVaR{nc}: {cvar_port * 100:.2f}%",
+               annotation_position="bottom left")
+fig2.update_layout(
+    title=("Distribucion posterior del retorno del portafolio BL+BKM<br>"
+           f"<sup>Asimetria: {metricas_post.loc['Skewness', f'BL+BKM {modo_efectivo.upper()}']:.3f} | "
+           f"Curtosis: {metricas_post.loc['Kurtosis', f'BL+BKM {modo_efectivo.upper()}']:.3f} | "
+           f"Horizonte: {etiqueta_horizonte}</sup>"),
+    xaxis_title=f"Retorno a {etiqueta_horizonte}", yaxis_title="Densidad",
+    template="plotly_white", height=520,
+)
+fig2.show()
+
 # =============================================================================
-# BLOQUE 11: MAXIMUM DRAWDOWN (MDD) DEL PORTAFOLIO MVSK
+# BLOQUE 11: MAXIMUM DRAWDOWN (MDD) DEL PORTAFOLIO OPTIMIZADO
 # =============================================================================
 
 print("\n=== ANALISIS DE MAXIMUM DRAWDOWN DEL PORTAFOLIO ===")
@@ -1080,7 +2459,7 @@ if precios_mdd is not None and len(precios_mdd) >= 10:
                   annotation_text=f"P90: {mdd_p90 * 100:.2f}%", annotation_position="bottom left",
                   annotation_font_color="darkorange")
     fig.update_layout(
-        title=dict(text="Maximum Drawdown Historico - Portafolio MVSK (BL + BKM)<br>"
+        title=dict(text="Maximum Drawdown Historico - Portafolio BL + BKM<br>"
                          f"<sup>Perfil: {PERFIL_RIESGO.upper()} | Horizonte: {etiqueta_horizonte} | "
                          f"MDD global ({MDD_START_YEAR}-hoy): {mdd_global * 100:.2f}% | "
                          f"{int(plot_data['con_dato'].sum())} anos con datos</sup>"),
@@ -1095,6 +2474,19 @@ else:
     print("  Datos insuficientes para calcular MDD (minimo 10 observaciones).")
     print("  Verifica que MDD_START_YEAR este dentro de la ventana de 2 anios.")
 
-print("\n=== FIN - BLACK-LITTERMAN + BKM + MVSK ===")
-print(f"Perfil: {PERFIL_RIESGO.upper()} | Horizonte: {etiqueta_horizonte} | "
-      f"Universo: {n} tickers | Views: {N_VIEWS} | MDD desde: {MDD_START_YEAR}")
+_pf = f"BL+BKM {modo_efectivo.upper()}"
+print("\n" + "=" * 79)
+print("FIN - BLACK-LITTERMAN EXTENDIDO POR MOMENTOS DE ORDEN SUPERIOR (BKM)")
+print("=" * 79)
+print(f"  Perfil de riesgo:       {PERFIL_RIESGO.upper()}")
+print(f"  Horizonte:              {etiqueta_horizonte} ({horizonte_dias} dias habiles)")
+print(f"  Universo:               {n} tickers | Views: {N_VIEWS}")
+print(f"  Ajuste Q -> P:          Mincer-Zarnowitz (VRP/SRP/KRP) + Esscher por GMM")
+print(f"  Posterior:              {metodo_posterior_usado} "
+      f"(ENS {info_post['ens'] * 100:.1f}% de {N_ESCENARIOS} escenarios)")
+print(f"  Optimizacion:           {modo_efectivo.upper()}")
+print(f"  VaR{nc} Cornish-Fisher:   {metricas_post.loc[f'VaR{nc}_CornishFisher', _pf]:.4f}")
+print(f"  CVaR{nc} historico:       {metricas_post.loc[f'CVaR{nc}_historico', _pf]:.4f}")
+print(f"  Sortino / Omega:        {metricas_post.loc['Sortino', _pf]:.3f} / "
+      f"{metricas_post.loc['Omega', _pf]:.3f}")
+print(f"  MDD analizado desde:    {MDD_START_YEAR}")
