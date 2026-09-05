@@ -78,6 +78,21 @@ UMBRAL_PESO_MIN = 0.005
 MAX_TICKERS_FINAL = 10
 PESO_MAX_ACTIVO = 0.35          # cota superior por activo en la optimizacion
 
+# --- Validacion de factibilidad de cardinalidad -----------------------------
+# Con sum(w) = 1 y 0 <= w_i <= PESO_MAX_ACTIVO sobre un soporte de a lo sumo
+# MAX_TICKERS_FINAL activos, el problema es infactible si
+# MAX_TICKERS_FINAL * PESO_MAX_ACTIVO < 1.0 (no alcanza para sumar 1). Se
+# corrige automaticamente subiendo PESO_MAX_ACTIVO al minimo necesario, con
+# un margen pequeno para evitar quedar justo en el borde numerico.
+_cap_cardinalidad = MAX_TICKERS_FINAL * PESO_MAX_ACTIVO
+if _cap_cardinalidad < 1.0:
+    _peso_max_previo = PESO_MAX_ACTIVO
+    PESO_MAX_ACTIVO = min(1.0, (1.0 / MAX_TICKERS_FINAL) * 1.05)
+    print(f"  AVISO: MAX_TICKERS_FINAL({MAX_TICKERS_FINAL}) x "
+          f"PESO_MAX_ACTIVO({_peso_max_previo:.4f}) = {_cap_cardinalidad:.4f} < 1.0 "
+          f"=> el optimizador quedaria infactible en sum(w)=1. "
+          f"Se ajusta PESO_MAX_ACTIVO a {PESO_MAX_ACTIVO:.4f}.")
+
 # -----------------------------------------------------------------------------
 # 6. TASA LIBRE DE RIESGO - FALLBACK
 # -----------------------------------------------------------------------------
@@ -2006,9 +2021,26 @@ def aplicar_limites_cartera(w, umbral=UMBRAL_PESO_MIN, max_activos=MAX_TICKERS_F
     return mask
 
 
+def _retorno_min_factible(retorno_deseado, mu_vec, activos_permitidos=None, etiqueta=""):
+    """Recorta el retorno objetivo del LP de CVaR al maximo alcanzable dentro
+    del conjunto de activos permitidos (mu_max = max(mu_vec) sobre el
+    soporte). Un retorno_min por encima de ese maximo vuelve el LP infactible
+    solo por la restriccion de retorno, sin que eso refleje ningun problema
+    real de riesgo: se ajusta dinamicamente en vez de fallar."""
+    mu_disp = mu_vec if activos_permitidos is None else mu_vec[activos_permitidos]
+    r_max = float(np.max(mu_disp))
+    if retorno_deseado > r_max:
+        print(f"  Aviso: retorno objetivo ({retorno_deseado:.4f}) supera el maximo "
+              f"retorno alcanzable{etiqueta} ({r_max:.4f}); se ajusta al maximo.")
+        return r_max
+    return retorno_deseado
+
+
 # --- Retorno minimo exigido en modo CVaR ------------------------------------
-retorno_min_efectivo = (float(w_mkt @ mu_opt) if RETORNO_MIN_CVAR is None
-                        else float(RETORNO_MIN_CVAR))
+retorno_min_deseado = (float(w_mkt @ mu_opt) if RETORNO_MIN_CVAR is None
+                       else float(RETORNO_MIN_CVAR))
+retorno_min_efectivo = _retorno_min_factible(retorno_min_deseado, mu_opt,
+                                             etiqueta=" en el universo completo")
 
 # --- Primera pasada ---------------------------------------------------------
 if MODO_OPTIMIZACION == "cvar":
@@ -2039,17 +2071,21 @@ print(f"  Soporte final: {int(mask_final.sum())} activos "
       f"(umbral {UMBRAL_PESO_MIN:.1%}, maximo {MAX_TICKERS_FINAL})")
 
 if modo_efectivo == "cvar":
+    # El soporte reducido (MAX_TICKERS_FINAL activos) puede no alcanzar el
+    # retorno minimo del universo completo: se recorta el target al maximo
+    # retorno posible del subconjunto ANTES de resolver, en vez de esperar a
+    # que el LP falle por infactibilidad.
+    retorno_min_soporte = _retorno_min_factible(
+        retorno_min_efectivo, mu_opt, activos_permitidos=mask_final,
+        etiqueta=" en el soporte reducido")
     w_re, info_re = optimizar_min_cvar(X_prior, p_post, ALPHA_CVAR_OBJETIVO,
-                                       retorno_min_efectivo, mu_opt,
+                                       retorno_min_soporte, mu_opt,
                                        activos_permitidos=mask_final)
     if w_re is None:
-        # El retorno minimo puede ser inalcanzable en el soporte reducido
-        print("  Re-optimizacion CVaR infactible en el soporte reducido; "
-              "se relaja la restriccion de retorno al maximo alcanzable.")
-        r_max_soporte = float(np.max(mu_opt[mask_final]))
-        w_re, info_re = optimizar_min_cvar(X_prior, p_post, ALPHA_CVAR_OBJETIVO,
-                                           min(retorno_min_efectivo, r_max_soporte),
-                                           mu_opt, activos_permitidos=mask_final)
+        # Infactibilidad residual por otra causa (no el retorno minimo, ya
+        # acotado arriba); se usa el bruto truncado y renormalizado.
+        print(f"  Re-optimizacion CVaR infactible en el soporte reducido "
+              f"({info_re['mensaje']}); se usa el bruto truncado y renormalizado.")
     w_opt = w_re if w_re is not None else (w_bruto * mask_final) / (w_bruto * mask_final).sum()
 else:
     w_ini = np.where(mask_final, w_bruto, 0.0)
